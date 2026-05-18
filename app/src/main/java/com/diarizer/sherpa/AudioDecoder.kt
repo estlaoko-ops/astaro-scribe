@@ -53,8 +53,9 @@ object AudioDecoder {
             codec.start()
 
             val bufferInfo = MediaCodec.BufferInfo()
-            // Accumulate float samples directly — no intermediate ByteArray copies
-            var floatAccumulator = mutableListOf<Float>()
+            // Accumulate float samples using growing FloatArray (no boxing!)
+            var floatBuffer = FloatArray(65536)
+            var floatSize = 0
             var isDone = false
             var outputPcmEncoding = ENCODING_PCM_16BIT
             var outputChannels = srcChannels
@@ -113,8 +114,15 @@ object AudioDecoder {
                             buf.get(chunk)
                             totalRawBytes += bufferInfo.size
 
+                            // Estimate max samples this chunk will produce and grow buffer
+                            val maxNewSamples = chunk.size / 2 // worst case: 16-bit mono
+                            if (floatSize + maxNewSamples > floatBuffer.size) {
+                                val newSize = maxOf(floatBuffer.size * 3 / 2, floatSize + maxNewSamples + 4096)
+                                floatBuffer = floatBuffer.copyOf(newSize)
+                            }
+
                             // Convert this chunk to mono float samples immediately
-                            chunkToFloatMono(chunk, outputPcmEncoding, outputChannels, floatAccumulator)
+                            floatSize = chunkToFloatMono(chunk, outputPcmEncoding, outputChannels, floatBuffer, floatSize)
                         }
                         codec.releaseOutputBuffer(outIdx, false)
                     }
@@ -128,13 +136,12 @@ object AudioDecoder {
             codec.release()
             extractor.release()
 
-            if (floatAccumulator.isEmpty()) return null
+            if (floatSize == 0) return null
 
-            Log.i(TAG, "Decoded $totalRawBytes raw bytes → ${floatAccumulator.size} float samples")
+            Log.i(TAG, "Decoded $totalRawBytes raw bytes → $floatSize float samples")
 
-            // Convert to array
-            val floatSamples = floatAccumulator.toFloatArray()
-            floatAccumulator.clear() // free memory
+            // Trim buffer to actual size and free temporary references
+            val floatSamples = floatBuffer.copyOf(floatSize)
 
             // Resample to 16kHz if needed
             val finalSamples = if (outputSampleRate != TARGET_SAMPLE_RATE) {
@@ -153,33 +160,39 @@ object AudioDecoder {
         }
     }
 
-    /** Convert a raw PCM chunk to mono float samples and append to accumulator. */
-    private fun chunkToFloatMono(chunk: ByteArray, encoding: Int, channels: Int, accumulator: MutableList<Float>) {
+    /** Convert a raw PCM chunk to mono float samples and append to buffer. Returns new size. */
+    private fun chunkToFloatMono(chunk: ByteArray, encoding: Int, channels: Int, buffer: FloatArray, offset: Int): Int {
+        var pos = offset
+        // Ensure buffer has room - caller is responsible for growing
         when (encoding) {
             ENCODING_PCM_FLOAT -> {
                 val floatBuf = ByteBuffer.wrap(chunk).order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer()
                 val srcSamples = chunk.size / 4 / channels
+                var bufPos = 0
                 for (i in 0 until srcSamples) {
                     var sum = 0f
                     for (ch in 0 until channels) {
-                        sum += floatBuf.get(i * channels + ch)
+                        sum += floatBuf.get(bufPos++)
                     }
-                    accumulator.add(sum / channels)
+                    buffer[pos++] = sum / channels
                 }
             }
             else -> {
                 val byteBuf = ByteBuffer.wrap(chunk).order(ByteOrder.LITTLE_ENDIAN)
                 val srcSamples = chunk.size / 2 / channels
+                var bufPos = 0
                 for (i in 0 until srcSamples) {
                     var sum = 0
                     for (ch in 0 until channels) {
-                        sum += byteBuf.getShort((i * channels + ch) * 2).toInt()
+                        sum += byteBuf.getShort(bufPos).toInt()
+                        bufPos += 2
                     }
                     val avg = (sum / channels).coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
-                    accumulator.add(avg.toFloat() / 32768f)
+                    buffer[pos++] = avg.toFloat() / 32768f
                 }
             }
         }
+        return pos
     }
 
     /** Simple linear resampling. Operates on FloatArray directly. */
