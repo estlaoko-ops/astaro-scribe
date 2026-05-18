@@ -100,6 +100,8 @@ class MainActivity : ComponentActivity() {
                                     onError("Ошибка ML-диаризации")
                                     stopService(Intent(this@MainActivity, TranscriberService::class.java))
                                 }
+                                savedDecodedAudio?.cleanup()
+                                savedDecodedAudio = null
                             } catch (e: Exception) {
                                 onError("Ошибка: ${e.message}")
                                 stopService(Intent(this@MainActivity, TranscriberService::class.java))
@@ -176,6 +178,8 @@ class MainActivity : ComponentActivity() {
                             } catch (e: Exception) {
                                 onError("Ошибка: ${e.message}")
                             } finally {
+                                savedDecodedAudio?.cleanup()
+                                savedDecodedAudio = null
                                 onProgress("")
                             }
                         }
@@ -205,10 +209,16 @@ class MainActivity : ComponentActivity() {
                             } catch (e: Exception) {
                                 onError("Ошибка: ${e.message}")
                             } finally {
+                                savedDecodedAudio?.cleanup()
+                                savedDecodedAudio = null
                                 stopService(Intent(this@MainActivity, TranscriberService::class.java))
                                 onProgress("")
                             }
                         }
+                    },
+                    onClearAudio = {
+                        savedDecodedAudio?.cleanup()
+                        savedDecodedAudio = null
                     }
                 )
             }
@@ -217,6 +227,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        savedDecodedAudio?.cleanup()
+        savedDecodedAudio = null
         pipeline?.release()
     }
 }
@@ -270,7 +282,8 @@ fun MainScreen(
         onLog: (String) -> Unit,
         onComplete: (List<Pipeline.TranscribedSegment>) -> Unit,
         onError: (String) -> Unit
-    ) -> Unit = { _, _, _, _, _ -> }
+    ) -> Unit = { _, _, _, _, _ -> },
+    onClearAudio: () -> Unit = {}
 ) {
     val scope = rememberCoroutineScope()
     val scrollState = rememberScrollState()
@@ -436,6 +449,7 @@ fun MainScreen(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri ->
         uri?.let {
+            onClearAudio()
             val docFile = DocumentFile.fromSingleUri(context, it)
             selectedFilename = docFile?.name ?: "audio file"
             selectedUri = it

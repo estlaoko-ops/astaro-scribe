@@ -16,6 +16,12 @@ class Pipeline(private val context: Context) {
         val tempFile: java.io.File? = null,
         val numSamples: Int = 0
     ) {
+        /** Delete temp file if present. Safe to call multiple times. */
+        fun cleanup() {
+            if (tempFile != null && tempFile.exists()) {
+                tempFile.delete()
+            }
+        }
         /** Read a range of samples. For file-backed, reads from disk. */
         fun readChunk(start: Int, end: Int): FloatArray {
             samples?.let { return it.sliceArray(start until end) }
