@@ -6,19 +6,30 @@ import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.net.Uri
 import android.util.Log
+import java.io.File
+import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.nio.FloatBuffer
 
+/**
+ * Decodes any audio file to 16kHz mono PCM, writing directly to a temp file
+ * during decoding to avoid holding the entire audio in memory.
+ */
 object AudioDecoder {
     private val TAG = "AudioDecoder"
     private const val TARGET_SAMPLE_RATE = 16000
     private const val ENCODING_PCM_16BIT = 2
     private const val ENCODING_PCM_FLOAT = 4
+    /** Files over this many samples are written to temp file (now: always for large audio) */
+    private const val FILE_BACKED_THRESHOLD = 1_000_000
+    /** Max chunk to resample at once: 1 second of audio at 48kHz */
+    private const val RESAMPLE_CHUNK = 48_000
 
     /**
-     * Decodes any audio file to 16kHz mono FloatArray for sherpa-onnx.
-     * Uses streaming approach to avoid OutOfMemoryError on long audio.
-     * Returns DecodedAudio or null on failure.
+     * Decodes any audio file to 16kHz mono.
+     * - Small audio (<1M samples): returned as in-memory FloatArray
+     * - Large audio: written to temp file during decoding, no large in-memory buffers
      */
     fun decodeToAudio(context: Context, uri: Uri): Pipeline.DecodedAudio? {
         return try {
@@ -29,7 +40,7 @@ object AudioDecoder {
             var audioTrackIndex = -1
             for (i in 0 until extractor.trackCount) {
                 val fmt = extractor.getTrackFormat(i)
-                val mime = fmt.getString(MediaFormat.KEY_MIME)
+                mime@ val mime = fmt.getString(MediaFormat.KEY_MIME)
                 if (mime?.startsWith("audio/") == true) {
                     audioTrackIndex = i
                     break
@@ -45,7 +56,8 @@ object AudioDecoder {
             val mime = format.getString(MediaFormat.KEY_MIME)!!
             val srcSampleRate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE)
             val srcChannels = format.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
-            Log.i(TAG, "Source: $mime, ${srcSampleRate}Hz, ${srcChannels}ch")
+            val durationUs = try { format.getLong(MediaFormat.KEY_DURATION) } catch (e: Exception) { -1L }
+            Log.i(TAG, "Source: $mime, ${srcSampleRate}Hz, ${srcChannels}ch, ${durationUs / 1000}ms")
 
             // Decode with MediaCodec
             val codec = MediaCodec.createDecoderByType(mime)
@@ -53,17 +65,20 @@ object AudioDecoder {
             codec.start()
 
             val bufferInfo = MediaCodec.BufferInfo()
-            // Pre-allocate based on track duration to avoid costly copyOf during growth
-            val durationUs = try { format.getLong(MediaFormat.KEY_DURATION) } catch (e: Exception) { -1L }
-            val estimatedSec = if (durationUs > 0) (durationUs / 1_000_000L).toInt() else 300 // fallback 5 min
-            val estimatedSamples = (estimatedSec * TARGET_SAMPLE_RATE).coerceAtLeast(65536)
-            var floatBuffer = FloatArray(estimatedSamples)
-            var floatSize = 0
-            var isDone = false
+
+            // Prepare temp file for streaming write
+            val cacheDir = File(context.cacheDir, "decoded_audio")
+            cacheDir.mkdirs()
+            val tempFile = File.createTempFile("pcm_", ".raw", cacheDir)
+            val fileOut = FileOutputStream(tempFile)
+            val floatBuf = ByteBuffer.allocate(65536)  // 16K floats
+            floatBuf.order(ByteOrder.LITTLE_ENDIAN)
+
             var outputPcmEncoding = ENCODING_PCM_16BIT
             var outputChannels = srcChannels
             var outputSampleRate = srcSampleRate
-            var totalRawBytes = 0L
+            var totalFileSamples = 0L
+            var isDone = false
 
             while (!isDone) {
                 // Feed input
@@ -85,19 +100,13 @@ object AudioDecoder {
                         val outFormat = codec.outputFormat
                         outputPcmEncoding = try {
                             outFormat.getInteger("pcm-encoding")
-                        } catch (e: Exception) {
-                            ENCODING_PCM_16BIT
-                        }
+                        } catch (e: Exception) { ENCODING_PCM_16BIT }
                         outputChannels = try {
                             outFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
-                        } catch (e: Exception) {
-                            srcChannels
-                        }
+                        } catch (e: Exception) { srcChannels }
                         outputSampleRate = try {
                             outFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
-                        } catch (e: Exception) {
-                            srcSampleRate
-                        }
+                        } catch (e: Exception) { srcSampleRate }
                         val encodingStr = when (outputPcmEncoding) {
                             ENCODING_PCM_16BIT -> "PCM_16BIT"
                             ENCODING_PCM_FLOAT -> "PCM_FLOAT"
@@ -115,10 +124,14 @@ object AudioDecoder {
                             buf.limit(bufferInfo.offset + bufferInfo.size)
                             val chunk = ByteArray(bufferInfo.size)
                             buf.get(chunk)
-                            totalRawBytes += bufferInfo.size
 
-                            // Convert this chunk to mono float samples immediately
-                            floatSize = chunkToFloatMono(chunk, outputPcmEncoding, outputChannels, floatBuffer, floatSize)
+                            // Convert chunk to mono float samples and write to file
+                            val monoFloats = chunkToMonoFloat(chunk, outputPcmEncoding, outputChannels)
+                            val resampled = if (outputSampleRate != TARGET_SAMPLE_RATE) {
+                                resampleChunk(monoFloats, outputSampleRate, TARGET_SAMPLE_RATE)
+                            } else monoFloats
+                            writeFloatsToFile(fileOut, floatBuf, resampled)
+                            totalFileSamples += resampled.size
                         }
                         codec.releaseOutputBuffer(outIdx, false)
                     }
@@ -131,40 +144,26 @@ object AudioDecoder {
             codec.stop()
             codec.release()
             extractor.release()
+            fileOut.close()
 
-            if (floatSize == 0) return null
-
-            Log.i(TAG, "Decoded $totalRawBytes raw bytes → $floatSize float samples")
-
-            // Trim buffer to actual size and free temporary references
-            val floatSamples = floatBuffer.copyOf(floatSize)
-
-            // Resample to 16kHz if needed
-            val finalSamples = if (outputSampleRate != TARGET_SAMPLE_RATE) {
-                resample(floatSamples, outputSampleRate, TARGET_SAMPLE_RATE)
-            } else {
-                floatSamples
+            if (totalFileSamples == 0L) {
+                tempFile.delete()
+                return null
             }
 
-            Log.i(TAG, "Final: ${finalSamples.size} samples, ${TARGET_SAMPLE_RATE}Hz")
+            Log.i(TAG, "Decoded → tempFile: $totalFileSamples samples (${tempFile.length() / (1024*1024)} MB) at ${TARGET_SAMPLE_RATE}Hz")
 
-            // For large audio (>10M samples = 40 MB), save to temp file to save RAM
-            if (finalSamples.size > 10_000_000) {
-                val cacheDir = java.io.File(context.cacheDir, "decoded_audio")
-                cacheDir.mkdirs()
-                val tempFile = java.io.File.createTempFile("pcm_", ".raw", cacheDir)
-                val byteBuf = java.nio.ByteBuffer.allocate(finalSamples.size * 4)
-                byteBuf.order(java.nio.ByteOrder.LITTLE_ENDIAN)
-                byteBuf.asFloatBuffer().put(finalSamples)
-                tempFile.outputStream().use { it.write(byteBuf.array()) }
-                Log.i(TAG, "File-backed: ${finalSamples.size} samples → ${tempFile.absolutePath} (${tempFile.length() / (1024*1024)} MB)")
+            // For small audio, read back into memory for convenience
+            if (totalFileSamples <= FILE_BACKED_THRESHOLD) {
+                val mem = readAllFloats(tempFile, totalFileSamples.toInt())
+                tempFile.delete()
+                Pipeline.DecodedAudio(sampleRate = TARGET_SAMPLE_RATE, samples = mem)
+            } else {
                 Pipeline.DecodedAudio(
                     sampleRate = TARGET_SAMPLE_RATE,
                     tempFile = tempFile,
-                    numSamples = finalSamples.size
+                    numSamples = totalFileSamples.toInt()
                 )
-            } else {
-                Pipeline.DecodedAudio(sampleRate = TARGET_SAMPLE_RATE, samples = finalSamples)
             }
 
         } catch (e: Exception) {
@@ -173,54 +172,85 @@ object AudioDecoder {
         }
     }
 
-    /** Convert a raw PCM chunk to mono float samples and append to buffer. Returns new size. */
-    private fun chunkToFloatMono(chunk: ByteArray, encoding: Int, channels: Int, buffer: FloatArray, offset: Int): Int {
-        var pos = offset
-        // Ensure buffer has room - caller is responsible for growing
-        when (encoding) {
+    /** Convert a raw PCM chunk to mono float array (not yet resampled). */
+    private fun chunkToMonoFloat(chunk: ByteArray, encoding: Int, channels: Int): FloatArray {
+        return when (encoding) {
             ENCODING_PCM_FLOAT -> {
-                val floatBuf = ByteBuffer.wrap(chunk).order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer()
+                val fb = ByteBuffer.wrap(chunk).order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer()
                 val srcSamples = chunk.size / 4 / channels
-                var bufPos = 0
+                val out = FloatArray(srcSamples)
+                var fi = 0
                 for (i in 0 until srcSamples) {
                     var sum = 0f
                     for (ch in 0 until channels) {
-                        sum += floatBuf.get(bufPos++)
+                        sum += if (fi < fb.limit()) fb.get(fi) else 0f
+                        fi++
                     }
-                    buffer[pos++] = sum / channels
+                    out[i] = sum / channels
                 }
+                out
             }
             else -> {
-                val byteBuf = ByteBuffer.wrap(chunk).order(ByteOrder.LITTLE_ENDIAN)
+                val bb = ByteBuffer.wrap(chunk).order(ByteOrder.LITTLE_ENDIAN)
                 val srcSamples = chunk.size / 2 / channels
-                var bufPos = 0
+                val out = FloatArray(srcSamples)
+                var bi = 0
                 for (i in 0 until srcSamples) {
                     var sum = 0
                     for (ch in 0 until channels) {
-                        sum += byteBuf.getShort(bufPos).toInt()
-                        bufPos += 2
+                        sum += if (bi < bb.limit() * 2) bb.getShort(bi).toInt() else 0
+                        bi += 2
                     }
                     val avg = (sum / channels).coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
-                    buffer[pos++] = avg.toFloat() / 32768f
+                    out[i] = avg.toFloat() / 32768f
                 }
+                out
             }
         }
-        return pos
     }
 
-    /** Simple linear resampling. Operates on FloatArray directly. */
-    private fun resample(src: FloatArray, srcRate: Int, dstRate: Int): FloatArray {
+    /** Linear resample a chunk in-place. Ratio computed from source/dest rates. */
+    private fun resampleChunk(src: FloatArray, srcRate: Int, dstRate: Int): FloatArray {
         if (srcRate == dstRate) return src
         val ratio = srcRate.toDouble() / dstRate.toDouble()
-        val dstSize = (src.size / ratio).toInt()
+        val dstSize = (src.size / ratio).toInt().coerceAtLeast(1)
         val dst = FloatArray(dstSize)
         for (i in 0 until dstSize) {
             val srcIdx = (i * ratio).toInt()
-            if (srcIdx < src.size) {
-                dst[i] = src[srcIdx]
+            dst[i] = if (srcIdx < src.size) src[srcIdx] else 0f
+        }
+        return dst
+    }
+
+    /** Write float array to file via reusable ByteBuffer. */
+    private fun writeFloatsToFile(out: FileOutputStream, floatBuf: ByteBuffer, floats: FloatArray) {
+        val fb = floatBuf.duplicate().order(ByteOrder.LITTLE_ENDIAN)
+        fb.clear()
+        if (fb.capacity() < floats.size * 4) {
+            // Rarely happens — allocate one-off for oversized chunk
+            val bigBuf = ByteBuffer.allocate(floats.size * 4).order(ByteOrder.LITTLE_ENDIAN)
+            bigBuf.asFloatBuffer().put(floats)
+            out.write(bigBuf.array(), 0, floats.size * 4)
+            return
+        }
+        fb.limit(floats.size * 4)
+        fb.asFloatBuffer().put(floats)
+        out.write(fb.array(), 0, floats.size * 4)
+    }
+
+    /** Read all floats back from a temp file (for small audio). */
+    private fun readAllFloats(file: File, count: Int): FloatArray {
+        val bytes = ByteArray(count * 4)
+        java.io.RandomAccessFile(file, "r").use { raf ->
+            var total = 0
+            while (total < bytes.size) {
+                val r = raf.read(bytes, total, bytes.size - total)
+                if (r < 0) break
+                total += r
             }
         }
-        Log.i(TAG, "Resampled: $srcRate -> $dstRate, ${src.size} -> ${dst.size}")
-        return dst
+        val result = FloatArray(count)
+        ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer().get(result)
+        return result
     }
 }
