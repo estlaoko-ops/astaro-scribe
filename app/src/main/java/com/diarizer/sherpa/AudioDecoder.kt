@@ -53,8 +53,11 @@ object AudioDecoder {
             codec.start()
 
             val bufferInfo = MediaCodec.BufferInfo()
-            // Accumulate float samples using growing FloatArray (no boxing!)
-            var floatBuffer = FloatArray(65536)
+            // Pre-allocate based on track duration to avoid costly copyOf during growth
+            val durationUs = try { format.getLong(MediaFormat.KEY_DURATION) } catch (e: Exception) { -1L }
+            val estimatedSec = if (durationUs > 0) (durationUs / 1_000_000L).toInt() else 300 // fallback 5 min
+            val estimatedSamples = (estimatedSec * TARGET_SAMPLE_RATE).coerceAtLeast(65536)
+            var floatBuffer = FloatArray(estimatedSamples)
             var floatSize = 0
             var isDone = false
             var outputPcmEncoding = ENCODING_PCM_16BIT
@@ -113,13 +116,6 @@ object AudioDecoder {
                             val chunk = ByteArray(bufferInfo.size)
                             buf.get(chunk)
                             totalRawBytes += bufferInfo.size
-
-                            // Estimate max samples this chunk will produce and grow buffer
-                            val maxNewSamples = chunk.size / 2 // worst case: 16-bit mono
-                            if (floatSize + maxNewSamples > floatBuffer.size) {
-                                val newSize = maxOf(floatBuffer.size * 3 / 2, floatSize + maxNewSamples + 4096)
-                                floatBuffer = floatBuffer.copyOf(newSize)
-                            }
 
                             // Convert this chunk to mono float samples immediately
                             floatSize = chunkToFloatMono(chunk, outputPcmEncoding, outputChannels, floatBuffer, floatSize)
