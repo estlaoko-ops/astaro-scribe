@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Ouroboros ring body (almost full circle with gap at top) -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:fillAlpha="0.9"
+        android:pathData="M54,11
+            C31.5,11 12,30.5 12,54
+            C12,77.5 31.5,97 54,97
+            C76.5,97 96,77.5 96,54
+            C96,30.5 76.5,11 54,11
+            Z"
+    />
+    <!-- Inner cutout to make it a ring -->
+    <path
+        android:fillColor="#1A1A2E"
+        android:pathData="M54,20
+            C35.7,20 21,34.7 21,54
+            C21,73.3 35.7,88 54,88
+            C72.3,88 87,73.3 87,54
+            C87,34.7 72.3,20 54,20
+            Z"
+    />
+
+    <!-- Gap at top: cover the top part to create open ring -->
+    <path
+        android:fillColor="#1A1A2E"
+        android:pathData="M40,11 L68,11 L68,22 L40,22 Z"
+    />
+
+    <!-- Snake head (right side of gap) -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:fillAlpha="0.9"
+        android:pathData="M58,11
+            C58,8 62,6 66,8
+            C70,10 68,14 64,14
+            C60,14 58,14 58,11 Z"
+    />
+    <!-- Head eye -->
+    <path
+        android:fillColor="#1A1A2E"
+        android:pathData="M63,9.5 A1.2,1.2 0 1,1 63,9.4"
+    />
+
+    <!-- Tail end (left side of gap) -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:fillAlpha="0.85"
+        android:pathData="M46,11
+            C46,11 44,14 48,15
+            C50,15.5 52,14 50,11.5 Z"
+    />
+
+    <!-- Golden letter A in center -->
+    <path
+        android:fillColor="#FFD700"
+        android:pathData="M42,70 L47,38 L54,38 L61,38 L66,70 L58,70 L56,60 L52,60 L50,70 L42,70 Z M54,43 L51,55 L57,55 L54,43 Z"
+    />
+
+    <!-- Subtle shine on A -->
+    <path
+        android:fillColor="#FFF9C4"
+        android:fillAlpha="0.4"
+        android:pathData="M44,68 L48,42 L51,42 L47,68 Z"
+    />
+
+</vector>
