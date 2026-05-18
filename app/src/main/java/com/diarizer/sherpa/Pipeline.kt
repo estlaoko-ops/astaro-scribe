@@ -8,7 +8,66 @@ import kotlin.math.sqrt
 class Pipeline(private val context: Context) {
     private val TAG = "Pipeline"
 
-    data class DecodedAudio(val samples: FloatArray, val sampleRate: Int)
+    data class DecodedAudio(
+        val sampleRate: Int,
+        /** In-memory samples (used for small files). Null when file-backed. */
+        val samples: FloatArray? = null,
+        /** Temp file with raw 32-bit float PCM (little-endian), 16kHz mono. */
+        val tempFile: java.io.File? = null,
+        val numSamples: Int = 0
+    ) {
+        /** Read a range of samples. For file-backed, reads from disk. */
+        fun readChunk(start: Int, end: Int): FloatArray {
+            samples?.let { return it.sliceArray(start until end) }
+            val count = end - start
+            val buf = FloatArray(count)
+            val file = tempFile ?: return buf
+            try {
+                val byteBuf = ByteArray(count * 4)
+                java.io.RandomAccessFile(file, "r").use { raf ->
+                    raf.seek(start * 4L)
+                    var totalRead = 0
+                    while (totalRead < byteBuf.size) {
+                        val read = raf.read(byteBuf, totalRead, byteBuf.size - totalRead)
+                        if (read < 0) break
+                        totalRead += read
+                    }
+                }
+                java.nio.ByteBuffer.wrap(byteBuf).order(java.nio.ByteOrder.LITTLE_ENDIAN).asFloatBuffer().get(buf)
+            } catch (e: Exception) {
+                Log.e("DecodedAudio", "File read error", e)
+            }
+            return buf
+        }
+
+        /** Read ALL samples from temp file into memory. Used by silence trimming. */
+        fun readAll(): FloatArray {
+            samples?.let { return it }
+            val file = tempFile ?: return FloatArray(0)
+            return try {
+                val byteCount = numSamples * 4L
+                if (byteCount > Int.MAX_VALUE.toLong()) {
+                    Log.w("DecodedAudio", "File too large for readAll: $byteCount bytes")
+                    return readChunk(0, numSamples.coerceAtMost(50_000_000))
+                }
+                val byteBuf = ByteArray(numSamples * 4)
+                java.io.RandomAccessFile(file, "r").use { raf ->
+                    var totalRead = 0
+                    while (totalRead < byteBuf.size) {
+                        val read = raf.read(byteBuf, totalRead, byteBuf.size - totalRead)
+                        if (read < 0) break
+                        totalRead += read
+                    }
+                }
+                val result = FloatArray(numSamples)
+                java.nio.ByteBuffer.wrap(byteBuf).order(java.nio.ByteOrder.LITTLE_ENDIAN).asFloatBuffer().get(result)
+                result
+            } catch (e: Exception) {
+                Log.e("DecodedAudio", "File readAll error", e)
+                FloatArray(0)
+            }
+        }
+    }
 
     private var recognizer: OfflineRecognizer? = null
     private var diarizer: OfflineSpeakerDiarization? = null
@@ -53,19 +112,22 @@ class Pipeline(private val context: Context) {
 
     fun runAsr(audio: DecodedAudio, onProgress: (String) -> Unit, onLog: (String) -> Unit = {}): String? {
         val r = recognizer ?: run { onLog("[ОШИБКА] ASR не инициализирован"); return null }
-        val samples = audio.samples; val sr = audio.sampleRate
-        if (samples.isEmpty()) { onLog("[ОШИБКА] Пустое аудио"); return null }
+        val sr = audio.sampleRate
+
+        // Load full audio for VAD analysis (temp - freed after trim)
+        val fullSamples = audio.readAll()
+        if (fullSamples.isEmpty()) { onLog("[ОШИБКА] Пустое аудио"); return null }
 
         // Диагностика: статистика аудиосигнала
-        val totalSec = samples.size.toFloat() / sr
-        val rmsFirst = rmsLevel(samples, 0, minOf(sr, samples.size))
-        val rmsLast = rmsLevel(samples, maxOf(0, samples.size - sr), samples.size)
-        onLog("[ДИАГН] Длительность: ${"%.1f".format(totalSec)}с, семплов: ${samples.size}")
+        val totalSec = fullSamples.size.toFloat() / sr
+        val rmsFirst = rmsLevel(fullSamples, 0, minOf(sr, fullSamples.size))
+        val rmsLast = rmsLevel(fullSamples, maxOf(0, fullSamples.size - sr), fullSamples.size)
+        onLog("[ДИАГН] Длительность: ${"%.1f".format(totalSec)}с, семплов: ${fullSamples.size}")
         onLog("[ДИАГН] RMS начало: ${"%.3f".format(rmsFirst)}, RMS конец: ${"%.3f".format(rmsLast)}")
 
         // Обрезка тишины перед ASR
         onProgress("Обрезаю тишину...")
-        val trimmed = trimSilence(samples, sr)
+        val trimmed = trimSilence(fullSamples, sr)
         val trimmedSec = trimmed.size.toFloat() / sr
         val trimmedOff = totalSec - trimmedSec
         if (trimmedOff > 0.5f) {
@@ -89,12 +151,14 @@ class Pipeline(private val context: Context) {
                 val sb = StringBuilder()
                 for (i in chunks.indices) {
                     val (start, end) = chunks[i]
-                    val text = transcribe(r, trimmed.sliceArray(start until end), sr)
+                    // Read chunk from audio (file-backed reads from disk, saving memory)
+                    val chunkSamples = audio.readChunk(trimSilenceStart(fullSamples, sr) + start,
+                                                       trimSilenceStart(fullSamples, sr) + end)
+                    val text = transcribe(r, chunkSamples, sr)
                     if (text.isNotEmpty()) {
                         if (sb.isNotEmpty()) sb.append(" ")
                         sb.append(text)
                     }
-                    // ETA после завершения чанка: среднее время на чанк x всего чанков
                     val elapsed = System.currentTimeMillis() - startMs
                     val perChunk = elapsed / (i + 1)
                     val etaTotal = perChunk * chunks.size / 1000
@@ -106,6 +170,23 @@ class Pipeline(private val context: Context) {
                 sb.toString().trim()
             }
         } catch (e: Exception) { logError("Ошибка ASR", e); onLog("[ОШИБКА] ${e.message}"); null }
+    }
+
+    /** Returns the sample offset where silence was trimmed from start. */
+    private fun trimSilenceStart(samples: FloatArray, sr: Int): Int {
+        val frameSize = (sr * FRAME_MS / 1000).coerceAtLeast(1)
+        val nFrames = samples.size / frameSize
+        if (nFrames < 4) return 0
+        val energy = FloatArray(nFrames) { i ->
+            val st = i * frameSize; val en = minOf(st + frameSize, samples.size)
+            var sum = 0f; for (j in st until en) sum += samples[j] * samples[j]
+            sqrt(sum / (en - st))
+        }
+        var first = -1
+        for (i in energy.indices) {
+            if (energy[i] > SILENCE_THR) { if (first < 0) first = i; break }
+        }
+        return (first - 7).coerceAtLeast(0) * frameSize
     }
 
     private fun transcribe(r: OfflineRecognizer, s: FloatArray, sr: Int): String {
@@ -169,7 +250,7 @@ class Pipeline(private val context: Context) {
         if (text.isEmpty()) return text
         onProgress("Детектирую паузы..."); onLog("[INFO] Анализирую паузы...")
 
-        val rawSegs = detectSegments(audio.samples, audio.sampleRate)
+        val rawSegs = detectSegments(audio.readAll(), audio.sampleRate)
         onLog("[INFO] ${rawSegs.size} сегментов")
         if (rawSegs.size < 2) return text
 
@@ -296,18 +377,18 @@ class Pipeline(private val context: Context) {
         val d = diarizer ?: run { onLog("[ОШИБКА] Диаризация не инициализирована"); return null }
         return try {
             onProgress("Извлекаю эмбеддинги...")
-            val totalSec = audio.samples.size.toFloat() / audio.sampleRate
-            onLog("[ДИАР.] Обрабатываю аудио: ${audio.samples.size} семплов, ${"%.1f".format(totalSec)}с")
-
+            val allSamples = audio.readAll()
+            val totalSec = allSamples.size.toFloat() / audio.sampleRate
+            onLog("[ДИАР.] Обрабатываю аудио: ${allSamples.size} семплов, ${"%.1f".format(totalSec)}с")
             // Normalize audio volume
-            val maxAbs = audio.samples.maxOf { kotlin.math.abs(it) }
+            val maxAbs = allSamples.maxOf { kotlin.math.abs(it) }
             val normalized = if (maxAbs > 0f && maxAbs < 0.5f) {
                 val scale = 0.95f / maxAbs
                 onLog("[ДИАР.] Нормализация: пик был ${"%.4f".format(maxAbs)}, усиление в ${"%.1f".format(scale)}x")
-                FloatArray(audio.samples.size) { audio.samples[it] * scale }
+                FloatArray(allSamples.size) { allSamples[it] * scale }
             } else {
                 onLog("[ДИАР.] Громкость норм (пик=${"%.4f".format(maxAbs)}), без нормализации")
-                audio.samples
+                allSamples
             }
 
             // Pass the entire audio to the model at once (no chunking)
@@ -397,7 +478,7 @@ class Pipeline(private val context: Context) {
         if (text.isEmpty()) { onLog("[ДИАР.] Пустой текст, диаризация не нужна"); return text }
         return try {
             onProgress("Извлекаю эмбеддинги...")
-            val segments = d.process(audio.samples)
+            val segments = d.process(audio.readAll())
             onLog("[ДИАР.] ${segments.size} сегментов от ML-диаризации")
 
             if (segments.size < 2) return text
@@ -466,7 +547,7 @@ class Pipeline(private val context: Context) {
             return emptyList()
         }
         val sampleRate = audio.sampleRate
-        val samples = audio.samples
+        val samples = audio.readAll()
         val result = mutableListOf<TranscribedSegment>()
 
         for ((i, seg) in segments.withIndex()) {

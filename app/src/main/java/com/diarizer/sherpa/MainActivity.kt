@@ -63,7 +63,7 @@ class MainActivity : ComponentActivity() {
                                     return@launch
                                 }
                                 savedDecodedAudio = decoded
-                                onLog("[ДЕКОДЕР] Аудио: ${decoded.samples.size} семплов, ${decoded.sampleRate}Гц, длительность ${"%.1f".format(decoded.samples.size.toFloat() / decoded.sampleRate)}с")
+                                onLog("[ДЕКОДЕР] Аудио: ${(decoded.samples?.size ?: decoded.numSamples)} семплов, ${decoded.sampleRate}Гц, длительность ${"%.1f".format((decoded.samples?.size ?: decoded.numSamples).toFloat() / decoded.sampleRate)}с")
 
                                 onProgress("Загружаю модели диаризации...")
                                 if (pipeline?.isDiarizationLoaded() != true) {
@@ -115,8 +115,8 @@ class MainActivity : ComponentActivity() {
 
                                 if (decoded != null) {
                                     savedDecodedAudio = decoded  // Save for later diarization
-                                    onLog("[ДЕКОДЕР] ✅ Аудио: ${decoded.samples.size} семплов, ${decoded.sampleRate}Гц")
-                                    logger?.log("Аудио декодировано: ${decoded.samples.size} семплов, ${decoded.sampleRate}Гц")
+                                    onLog("[ДЕКОДЕР] ✅ Аудио: ${(decoded.samples?.size ?: decoded.numSamples)} семплов, ${decoded.sampleRate}Гц")
+                                    logger?.log("Аудио декодировано: ${(decoded.samples?.size ?: decoded.numSamples)} семплов, ${decoded.sampleRate}Гц")
 
                                     onProgress("Распознаю речь...")
                                     val pipelineResult = withContext(Dispatchers.IO) {

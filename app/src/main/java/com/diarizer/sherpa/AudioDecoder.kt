@@ -148,7 +148,24 @@ object AudioDecoder {
 
             Log.i(TAG, "Final: ${finalSamples.size} samples, ${TARGET_SAMPLE_RATE}Hz")
 
-            Pipeline.DecodedAudio(finalSamples, TARGET_SAMPLE_RATE)
+            // For large audio (>10M samples = 40 MB), save to temp file to save RAM
+            if (finalSamples.size > 10_000_000) {
+                val cacheDir = java.io.File(context.cacheDir, "decoded_audio")
+                cacheDir.mkdirs()
+                val tempFile = java.io.File.createTempFile("pcm_", ".raw", cacheDir)
+                val byteBuf = java.nio.ByteBuffer.allocate(finalSamples.size * 4)
+                byteBuf.order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                byteBuf.asFloatBuffer().put(finalSamples)
+                tempFile.outputStream().use { it.write(byteBuf.array()) }
+                Log.i(TAG, "File-backed: ${finalSamples.size} samples → ${tempFile.absolutePath} (${tempFile.length() / (1024*1024)} MB)")
+                Pipeline.DecodedAudio(
+                    sampleRate = TARGET_SAMPLE_RATE,
+                    tempFile = tempFile,
+                    numSamples = finalSamples.size
+                )
+            } else {
+                Pipeline.DecodedAudio(sampleRate = TARGET_SAMPLE_RATE, samples = finalSamples)
+            }
 
         } catch (e: Exception) {
             Log.e(TAG, "Decode error", e)
