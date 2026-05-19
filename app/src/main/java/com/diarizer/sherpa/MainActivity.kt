@@ -182,11 +182,20 @@ class MainActivity : ComponentActivity() {
                             }
                         }
                     },
-                    onTranscribeDiarizationSegments = { segments, onProgress, onLog, onComplete, onError ->
+                    onTranscribeDiarizationSegments = { segments, uri, onProgress, onLog, onComplete, onError ->
                         startService(Intent(this@MainActivity, TranscriberService::class.java))
                         lifecycleScope.launch {
                             try {
-                                val audio = savedDecodedAudio
+                                var audio = savedDecodedAudio
+                                if (audio == null && uri != null) {
+                                    onLog("[ДЕКОДЕР] 🔄 savedDecodedAudio=null, передекодирую из URI...")
+                                    audio = withContext(Dispatchers.IO) {
+                                        AudioDecoder.decodeToAudio(this@MainActivity, uri)
+                                    }
+                                    if (audio != null) {
+                                        savedDecodedAudio = audio
+                                    }
+                                }
                                 if (audio == null) {
                                     onError("Нет декодированного аудио. Сначала выполните диаризацию (альфа).")
                                     return@launch
@@ -276,11 +285,12 @@ fun MainScreen(
     ) -> Unit = { _, _, _, _, _ -> },
     onTranscribeDiarizationSegments: (
         segments: List<Pipeline.SpeakerSegment>,
+        uri: android.net.Uri?,
         onProgress: (String) -> Unit,
         onLog: (String) -> Unit,
         onComplete: (List<Pipeline.TranscribedSegment>) -> Unit,
         onError: (String) -> Unit
-    ) -> Unit = { _, _, _, _, _ -> },
+    ) -> Unit = { _, _, _, _, _, _ -> },
     onClearAudio: () -> Unit = {}
 ) {
     val scope = rememberCoroutineScope()
@@ -1613,6 +1623,7 @@ Spacer(Modifier.height(8.dp))
                                             transcribingSegments = true
                                             onTranscribeDiarizationSegments(
                                                 timelineSegments,
+                                                timelineAudioUri,
                                                 { msg -> baseProgress = msg },
                                                 { msg ->
                                                     logLines.add(msg)
