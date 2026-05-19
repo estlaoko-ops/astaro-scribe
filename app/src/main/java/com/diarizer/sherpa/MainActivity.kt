@@ -100,8 +100,7 @@ class MainActivity : ComponentActivity() {
                                     onError("Ошибка ML-диаризации")
                                     stopService(Intent(this@MainActivity, TranscriberService::class.java))
                                 }
-                                savedDecodedAudio?.cleanup()
-                                savedDecodedAudio = null
+                                // Не чистим savedDecodedAudio — он нужен для onTranscribeDiarizationSegments
                             } catch (e: Exception) {
                                 onError("Ошибка: ${e.message}")
                                 stopService(Intent(this@MainActivity, TranscriberService::class.java))
