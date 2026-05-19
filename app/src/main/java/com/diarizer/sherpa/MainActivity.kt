@@ -178,8 +178,7 @@ class MainActivity : ComponentActivity() {
                             } catch (e: Exception) {
                                 onError("Ошибка: ${e.message}")
                             } finally {
-                                savedDecodedAudio?.cleanup()
-                                savedDecodedAudio = null
+                                // Не чистим savedDecodedAudio — он нужен для onTranscribeDiarizationSegments
                                 onProgress("")
                             }
                         }
