@@ -299,6 +299,7 @@ fun MainScreen(
     // Compact mode preference (persists across restarts)
     val prefs = context.getSharedPreferences("astaro_prefs", Context.MODE_PRIVATE)
     var isCompactMode by remember { mutableStateOf(prefs.getBoolean("compact_mode", false)) }
+    var remoteAsrEnabled by remember { mutableStateOf(prefs.getBoolean("remote_asr_enabled", false)) }
 
     var isInitialized by remember { mutableStateOf(false) }
     var isDownloading by remember { mutableStateOf(false) }
@@ -321,6 +322,7 @@ fun MainScreen(
     var showSettingsDialog by remember { mutableStateOf(false) }
     var settingsThresholdText by remember { mutableStateOf("") }
     var settingsThresholdError by remember { mutableStateOf(false) }
+    var settingsRemoteEnabled by remember { mutableStateOf(false) }
     var previousLogs by remember { mutableStateOf<List<FileLogger.SavedLog>>(emptyList()) }
     var selectedLog by remember { mutableStateOf<Pair<String, String>?>(null) }
 
@@ -447,7 +449,11 @@ fun MainScreen(
             isInitialized = success
         } else {
             logger.log("Модели не найдены — требуется загрузка")
-            logLines.add("[СИСТЕМА] Модели не найдены. Нажмите «Загрузить модели».")
+            if (remoteAsrEnabled) {
+                logLines.add("[СИСТЕМА] Режим: Whisper Turbo (сервер). Локальные модели не загружены.")
+            } else {
+                logLines.add("[СИСТЕМА] Модели не найдены. Нажмите «Загрузить модели».")
+            }
         }
 
         logFileCreated = true
@@ -696,12 +702,14 @@ fun MainScreen(
         LaunchedEffect(showSettingsDialog) {
             settingsThresholdText = currentThreshold.toString()
             settingsThresholdError = false
+            settingsRemoteEnabled = remoteAsrEnabled
         }
         AlertDialog(
             onDismissRequest = {
                 showSettingsDialog = false
                 settingsThresholdText = ""
                 settingsThresholdError = false
+                settingsRemoteEnabled = remoteAsrEnabled
             },
             title = {
                 Text(
@@ -774,6 +782,34 @@ fun MainScreen(
                         fontSize = 11.sp,
                         color = MaterialTheme.colorScheme.primary.copy(alpha = 0.7f)
                     )
+
+                    Divider(color = MaterialTheme.colorScheme.surfaceVariant, modifier = Modifier.padding(vertical = 12.dp))
+
+                    // Remote Whisper ASR
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(bottom = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Whisper Turbo (сервер)",
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.Medium,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                            Text(
+                                text = "Транскрибировать через облачный Whisper Turbo вместо локальной модели",
+                                fontSize = 11.sp,
+                                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f)
+                            )
+                        }
+                        Spacer(Modifier.width(8.dp))
+                        Switch(
+                            checked = settingsRemoteEnabled,
+                            onCheckedChange = { settingsRemoteEnabled = it }
+                        )
+                    }
                 }
             },
             confirmButton = {
@@ -781,10 +817,13 @@ fun MainScreen(
                     val threshold = settingsThresholdText.toFloatOrNull()
                     if (threshold != null && threshold > 0f && threshold < 1f) {
                         pipeline?.setClusterThreshold(threshold)
+                        pipeline?.setRemoteAsr(settingsRemoteEnabled)
+                        remoteAsrEnabled = settingsRemoteEnabled
                         showSettingsDialog = false
                         settingsThresholdText = ""
                         settingsThresholdError = false
                         logLines.add("[НАСТРОЙКИ] Порог кластеризации = $threshold")
+                        logLines.add("[НАСТРОЙКИ] Режим ASR: ${if (settingsRemoteEnabled) "Whisper Turbo (сервер)" else "локальный"}")
                     } else {
                         settingsThresholdError = true
                     }
@@ -797,6 +836,7 @@ fun MainScreen(
                     showSettingsDialog = false
                     settingsThresholdText = ""
                     settingsThresholdError = false
+                    settingsRemoteEnabled = remoteAsrEnabled
                 }) {
                     Text("Отмена", fontSize = 14.sp)
                 }
@@ -977,9 +1017,13 @@ fun MainScreen(
                 )
             }
 
-            if (isInitialized) {
+            val isReady = isInitialized || remoteAsrEnabled
+            if (isReady) {
                 Text(
-                    text = "✅ Whisper Small INT8 + ML-диаризация (бета)",
+                    text = if (remoteAsrEnabled)
+                        "✅ Whisper Turbo (сервер) + ML-диаризация (бета)"
+                    else
+                        "✅ Whisper Small INT8 + ML-диаризация (бета)",
                     fontSize = 12.sp,
                     color = MaterialTheme.colorScheme.tertiary.copy(alpha = 0.7f),
                     modifier = Modifier.padding(top = 4.dp, bottom = 4.dp)

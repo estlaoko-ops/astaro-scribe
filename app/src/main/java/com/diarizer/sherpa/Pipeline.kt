@@ -2,6 +2,7 @@ package com.diarizer.sherpa
 
 import android.content.Context
 import android.util.Log
+import com.diarizer.sherpa.BuildConfig
 import com.k2fsa.sherpa.onnx.*
 import kotlin.math.sqrt
 
@@ -82,14 +83,18 @@ class Pipeline(private val context: Context) {
     private var fileLogger: FileLogger? = null
     var clusterThreshold: Float = 0.45f
         private set
-    
+    var remoteAsrEnabled: Boolean = false; private set
+
     init {
         val prefs = context.getSharedPreferences("transcriber_prefs", Context.MODE_PRIVATE)
         clusterThreshold = prefs.getFloat("cluster_threshold", 0.45f)
+        val asPrefs = context.getSharedPreferences("astaro_prefs", Context.MODE_PRIVATE)
+        remoteAsrEnabled = asPrefs.getBoolean("remote_asr_enabled", false)
     }
 
     companion object {
         private const val CHUNK_SIZE = 400_000
+        private const val REMOTE_CHUNK_SAMPLES = 9_600_000  // ~10 min at 16kHz
         private const val FRAME_MS   = 30
         private const val SILENCE_THR = 0.015f
         private const val MIN_PAUSE_MS = 350f
@@ -99,6 +104,13 @@ class Pipeline(private val context: Context) {
     fun setFileLogger(logger: FileLogger?) { fileLogger = logger }
     private fun log(msg: String) { Log.i(TAG, msg); fileLogger?.log(msg) }
     private fun logError(msg: String, e: Throwable? = null) { Log.e(TAG, msg, e); fileLogger?.logError(msg, e) }
+
+    fun setRemoteAsr(enabled: Boolean) {
+        remoteAsrEnabled = enabled
+        context.getSharedPreferences("astaro_prefs", Context.MODE_PRIVATE)
+            .edit().putBoolean("remote_asr_enabled", enabled).apply()
+        log("Режим ASR: ${if (enabled) "сервер (${BuildConfig.WHISPER_SERVER_URL})" else "локальный"}")
+    }
 
     fun loadModels(): Boolean {
         val dir = ModelDownloader.getModelsDir(context)
@@ -117,6 +129,9 @@ class Pipeline(private val context: Context) {
     // ===== ASR — с обрезкой тишины и диагностикой =====
 
     fun runAsr(audio: DecodedAudio, onProgress: (String) -> Unit, onLog: (String) -> Unit = {}): String? {
+        if (remoteAsrEnabled) {
+            return runAsrRemote(audio, BuildConfig.WHISPER_SERVER_URL, onProgress, onLog)
+        }
         val r = recognizer ?: run { onLog("[ОШИБКА] ASR не инициализирован"); return null }
         val sr = audio.sampleRate
 
@@ -176,6 +191,144 @@ class Pipeline(private val context: Context) {
                 sb.toString().trim()
             }
         } catch (e: Exception) { logError("Ошибка ASR", e); onLog("[ОШИБКА] ${e.message}"); null }
+    }
+
+    // ===== REMOTE WHISPER ASR =====
+
+    private fun runAsrRemote(audio: DecodedAudio, serverUrl: String, onProgress: (String) -> Unit, onLog: (String) -> Unit): String? {
+        val allSamples = audio.readAll()
+        if (allSamples.isEmpty()) { onLog("[REMOTE] Пустое аудио"); return null }
+        val totalSec = allSamples.size.toFloat() / audio.sampleRate
+        onLog("[REMOTE] Отправка на Whisper Turbo: ${"%.1f".format(totalSec)}с")
+
+        if (allSamples.size <= REMOTE_CHUNK_SAMPLES) {
+            onProgress("Отправляю на сервер...")
+            val startMs = System.currentTimeMillis()
+            val text = transcribeRemote(allSamples, audio.sampleRate, serverUrl)
+            if (text == null) { onLog("[REMOTE] ❌ Нет ответа от сервера"); return null }
+            val durSec = (System.currentTimeMillis() - startMs) / 1000
+            onLog("[REMOTE] ✅ Готово за ${durSec / 60}:${"%02d".format(durSec % 60)} (${text.length} символов)")
+            return text
+        }
+
+        val sb = StringBuilder()
+        val numChunks = (allSamples.size + REMOTE_CHUNK_SAMPLES - 1) / REMOTE_CHUNK_SAMPLES
+        onLog("[REMOTE] Разбиваю на $numChunks чанков по ~10 мин")
+        val startMs = System.currentTimeMillis()
+        for (i in 0 until numChunks) {
+            val start = i * REMOTE_CHUNK_SAMPLES
+            val end = minOf(start + REMOTE_CHUNK_SAMPLES, allSamples.size)
+            val chunk = allSamples.sliceArray(start until end)
+            val elapsed = System.currentTimeMillis() - startMs
+            val perChunk = if (i > 0) elapsed / i else 0L
+            val eta = perChunk * (numChunks - i) / 1000
+            val etaStr = "${eta / 60}:${"%02d".format(eta % 60)}"
+            onProgress("Часть ${i + 1}/$numChunks${if (i > 0) " (ETA $etaStr)" else ""}...")
+            val text = transcribeRemote(chunk, audio.sampleRate, serverUrl)
+            if (text == null) { onLog("[REMOTE] ❌ Ошибка на чанке ${i + 1}"); return null }
+            if (sb.isNotEmpty() && text.isNotEmpty()) sb.append(" ")
+            sb.append(text)
+            onLog("[REMOTE] Чанк ${i + 1}/$numChunks: ${text.length} символов")
+        }
+        val totalDur = (System.currentTimeMillis() - startMs) / 1000
+        onLog("[REMOTE] ✅ Всего за ${totalDur / 60}:${"%02d".format(totalDur % 60)}")
+        return sb.toString().trim()
+    }
+
+    private fun transcribeRemote(samples: FloatArray, sampleRate: Int, serverUrl: String): String? {
+        return try {
+            val wavBytes = samplesToWavBytes(samples, sampleRate)
+            val boundary = "----AstaroBoundary${System.currentTimeMillis()}"
+            val conn = java.net.URL(serverUrl).openConnection() as java.net.HttpURLConnection
+            conn.requestMethod = "POST"
+            conn.doOutput = true
+            conn.setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
+            conn.setRequestProperty("Authorization", BuildConfig.WHISPER_AUTH)
+            conn.connectTimeout = 30_000
+            conn.readTimeout = 300_000
+
+            conn.outputStream.use { os ->
+                os.write("--$boundary\r\n".toByteArray())
+                os.write("Content-Disposition: form-data; name=\"model\"\r\n\r\n".toByteArray())
+                os.write("whisper-1\r\n".toByteArray())
+                os.write("--$boundary\r\n".toByteArray())
+                os.write("Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n".toByteArray())
+                os.write("Content-Type: audio/wav\r\n\r\n".toByteArray())
+                os.write(wavBytes)
+                os.write("\r\n--$boundary--\r\n".toByteArray())
+                os.flush()
+            }
+
+            val responseCode = conn.responseCode
+            if (responseCode != 200) {
+                val errBody = conn.errorStream?.bufferedReader()?.readText() ?: ""
+                logError("[REMOTE] HTTP $responseCode: $errBody")
+                conn.disconnect()
+                return null
+            }
+            val responseText = conn.inputStream.bufferedReader().readText()
+            conn.disconnect()
+            parseWhisperResponse(responseText)
+        } catch (e: Exception) {
+            logError("[REMOTE] Ошибка запроса", e)
+            null
+        }
+    }
+
+    private fun parseWhisperResponse(json: String): String {
+        val key = "\"text\":"
+        val idx = json.indexOf(key)
+        if (idx < 0) return json.trim()
+        val start = json.indexOf('"', idx + key.length)
+        if (start < 0) return ""
+        val sb = StringBuilder()
+        var i = start + 1
+        while (i < json.length) {
+            when {
+                json[i] == '\\' && i + 1 < json.length -> {
+                    when (json[i + 1]) {
+                        'n' -> sb.append('\n')
+                        't' -> sb.append('\t')
+                        'r' -> {} // skip \r
+                        '"' -> sb.append('"')
+                        '\\' -> sb.append('\\')
+                        else -> sb.append(json[i + 1])
+                    }
+                    i += 2
+                }
+                json[i] == '"' -> break
+                else -> { sb.append(json[i]); i++ }
+            }
+        }
+        return sb.toString()
+    }
+
+    private fun samplesToWavBytes(samples: FloatArray, sampleRate: Int): ByteArray {
+        val pcmData = ShortArray(samples.size) {
+            (samples[it] * 32767f).toInt().coerceIn(-32768, 32767).toShort()
+        }
+        val dataSize = pcmData.size * 2
+        val out = java.io.ByteArrayOutputStream(44 + dataSize)
+        out.write("RIFF".toByteArray())
+        out.write(intToLeBytes(36 + dataSize))
+        out.write("WAVE".toByteArray())
+        out.write("fmt ".toByteArray())
+        out.write(intToLeBytes(16))
+        out.write(shortToLeBytes(1))
+        out.write(shortToLeBytes(1))
+        out.write(intToLeBytes(sampleRate))
+        out.write(intToLeBytes(sampleRate * 2))
+        out.write(shortToLeBytes(2))
+        out.write(shortToLeBytes(16))
+        out.write("data".toByteArray())
+        out.write(intToLeBytes(dataSize))
+        val buf = ByteArray(pcmData.size * 2)
+        for (j in pcmData.indices) {
+            buf[j * 2]     = (pcmData[j].toInt() and 0xFF).toByte()
+            buf[j * 2 + 1] = (pcmData[j].toInt() shr 8 and 0xFF).toByte()
+        }
+        out.write(buf)
+        return out.toByteArray()
     }
 
     /** Returns the sample offset where silence was trimmed from start. */
@@ -548,7 +701,9 @@ class Pipeline(private val context: Context) {
         onProgress: (String) -> Unit,
         onLog: (String) -> Unit = {}
     ): List<TranscribedSegment> {
-        val r = recognizer ?: run {
+        val useRemote = remoteAsrEnabled
+        val r = recognizer
+        if (!useRemote && r == null) {
             onLog("[ОШИБКА] ASR не инициализирован для сегментов")
             return emptyList()
         }
@@ -569,7 +724,11 @@ class Pipeline(private val context: Context) {
             }
 
             val segmentSamples = samples.sliceArray(startSample until endSample)
-            val text = transcribe(r, segmentSamples, sampleRate)
+            val text = if (useRemote) {
+                transcribeRemote(segmentSamples, sampleRate, BuildConfig.WHISPER_SERVER_URL) ?: ""
+            } else {
+                transcribe(r!!, segmentSamples, sampleRate)
+            }
 
             // Save as WAV
             val wavFile = java.io.File(cacheDir,
