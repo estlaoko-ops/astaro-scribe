@@ -249,10 +249,7 @@ class Pipeline(private val context: Context) {
 
             conn.outputStream.use { os ->
                 os.write("--$boundary\r\n".toByteArray())
-                os.write("Content-Disposition: form-data; name=\"model\"\r\n\r\n".toByteArray())
-                os.write("whisper-1\r\n".toByteArray())
-                os.write("--$boundary\r\n".toByteArray())
-                os.write("Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n".toByteArray())
+                os.write("Content-Disposition: form-data; name=\"audio\"; filename=\"audio.wav\"\r\n".toByteArray())
                 os.write("Content-Type: audio/wav\r\n\r\n".toByteArray())
                 os.write(wavBytes)
                 os.write("\r\n--$boundary--\r\n".toByteArray())
@@ -277,7 +274,7 @@ class Pipeline(private val context: Context) {
 
     private fun parseWhisperResponse(json: String): String {
         val key = "\"text\":"
-        val idx = json.indexOf(key)
+        val idx = json.lastIndexOf(key)  // top-level "text" comes last, after segments array
         if (idx < 0) return json.trim()
         val start = json.indexOf('"', idx + key.length)
         if (start < 0) return ""
