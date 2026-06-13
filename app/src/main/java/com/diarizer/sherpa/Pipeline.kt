@@ -236,6 +236,10 @@ class Pipeline(private val context: Context) {
     }
 
     private fun transcribeRemote(samples: FloatArray, sampleRate: Int, serverUrl: String): String? {
+        if (serverUrl.isEmpty()) {
+            logError("[REMOTE] URL пустой — пересоберите APK после настройки local.properties")
+            return null
+        }
         return try {
             val wavBytes = samplesToWavBytes(samples, sampleRate)
             val boundary = "----AstaroBoundary${System.currentTimeMillis()}"

@@ -107,81 +107,6 @@ class MainActivity : ComponentActivity() {
                             }
                         }
                     },
-                    onStartProcessing = { uri, filename, logger, onProgress, onLog, onResult, onError ->
-                        startService(Intent(this@MainActivity, TranscriberService::class.java))
-                        lifecycleScope.launch {
-                            try {
-                                onProgress("Декодирую аудио...")
-                                val decoded = AudioDecoder.decodeToAudio(this@MainActivity, uri)
-
-                                if (decoded != null) {
-                                    savedDecodedAudio = decoded  // Save for later diarization
-                                    onLog("[ДЕКОДЕР] ✅ Аудио: ${(decoded.samples?.size ?: decoded.numSamples)} семплов, ${decoded.sampleRate}Гц")
-                                    logger?.log("Аудио декодировано: ${(decoded.samples?.size ?: decoded.numSamples)} семплов, ${decoded.sampleRate}Гц")
-
-                                    onProgress("Распознаю речь...")
-                                    val pipelineResult = withContext(Dispatchers.IO) {
-                                        pipeline?.runAsr(
-                                            audio = decoded,
-                                            onProgress = { msg -> onProgress(msg) },
-                                            onLog = { msg ->
-                                                onLog(msg)
-                                                logger?.log(msg)
-                                            }
-                                        )
-                                    }
-
-                                    if (pipelineResult != null && pipelineResult.isNotEmpty()) {
-                                        onResult(pipelineResult)
-                                    } else if (pipelineResult != null) {
-                                        onResult("Речь не распознана")
-                                    } else {
-                                        onError("Ошибка ASR. Смотрите логи.")
-                                    }
-                                } else {
-                                    onError("Не удалось декодировать аудио")
-                                }
-                            } catch (e: Exception) {
-                                onError("Ошибка: ${e.message}")
-                                logger?.logError("Исключение", e)
-                            } finally {
-                                stopService(Intent(this@MainActivity, TranscriberService::class.java))
-                                onProgress("")
-                            }
-                        }
-                    },
-                    onStartDiarization = { resultText, onProgress, onLog, onResult, onError ->
-                        lifecycleScope.launch {
-                            try {
-                                val audio = savedDecodedAudio
-                                if (audio == null) {
-                                    onError("Нет декодированного аудио. Сначала распознайте речь.")
-                                    return@launch
-                                }
-                                onProgress("Разделяю спикеров...")
-                                val diarResult = withContext(Dispatchers.IO) {
-                                    pipeline?.runDiarization(
-                                        audio = audio,
-                                        text = resultText,
-                                        onProgress = { msg -> onProgress(msg) },
-                                        onLog = { msg ->
-                                            onLog(msg)
-                                        }
-                                    )
-                                }
-                                if (diarResult != null) {
-                                    onResult(diarResult)
-                                } else {
-                                    onError("Ошибка диаризации")
-                                }
-                            } catch (e: Exception) {
-                                onError("Ошибка: ${e.message}")
-                            } finally {
-                                // Не чистим savedDecodedAudio — он нужен для onTranscribeDiarizationSegments
-                                onProgress("")
-                            }
-                        }
-                    },
                     onTranscribeDiarizationSegments = { segments, uri, onProgress, onLog, onComplete, onError ->
                         startService(Intent(this@MainActivity, TranscriberService::class.java))
                         lifecycleScope.launch {
@@ -267,22 +192,6 @@ fun MainScreen(
         onTimelineObject: (Pipeline.SpeakerTimeline) -> Unit,
         onError: (String) -> Unit
     ) -> Unit = { _, _, _, _, _, _, _ -> },
-    onStartProcessing: (
-        uri: Uri,
-        filename: String,
-        logger: FileLogger?,
-        onProgress: (String) -> Unit,
-        onLog: (String) -> Unit,
-        onResult: (String) -> Unit,
-        onError: (String) -> Unit
-    ) -> Unit = { _, _, _, _, _, _, _ -> },
-    onStartDiarization: (
-        resultText: String,
-        onProgress: (String) -> Unit,
-        onLog: (String) -> Unit,
-        onResult: (String) -> Unit,
-        onError: (String) -> Unit
-    ) -> Unit = { _, _, _, _, _ -> },
     onTranscribeDiarizationSegments: (
         segments: List<Pipeline.SpeakerSegment>,
         uri: android.net.Uri?,
@@ -296,9 +205,7 @@ fun MainScreen(
     val scope = rememberCoroutineScope()
     val scrollState = rememberScrollState()
 
-    // Compact mode preference (persists across restarts)
     val prefs = context.getSharedPreferences("astaro_prefs", Context.MODE_PRIVATE)
-    var isCompactMode by remember { mutableStateOf(prefs.getBoolean("compact_mode", false)) }
     var remoteAsrEnabled by remember { mutableStateOf(prefs.getBoolean("remote_asr_enabled", false)) }
 
     var isInitialized by remember { mutableStateOf(false) }
@@ -313,9 +220,6 @@ fun MainScreen(
     var initError by remember { mutableStateOf("") }
     var logFileCreated by remember { mutableStateOf(false) }
     var fileLogger by remember { mutableStateOf<FileLogger?>(null) }
-
-    // ASR done state — shows diarization button
-    var isAsrDone by remember { mutableStateOf(false) }
 
     // Logs dialog state
     var showLogsDialog by remember { mutableStateOf(false) }
@@ -332,12 +236,7 @@ fun MainScreen(
     // Diarization in progress
     var diarizationInProgress by remember { mutableStateOf(false) }
 
-    // Raw ASR result (without diarization) for toggle in modal
-    var rawAsrResult by remember { mutableStateOf("") }
-    var diarizedResult by remember { mutableStateOf("") }
-    var showDiarizedView by remember { mutableStateOf(false) }
-
-    // Speaker timeline modal (временная кнопка для тестов)
+    // Speaker timeline modal
     var speakerTimelineResult by remember { mutableStateOf("") }
     var showSpeakerTimelineModal by remember { mutableStateOf(false) }
     // Structured timeline data for player
@@ -471,10 +370,6 @@ fun MainScreen(
             result = ""
             error = ""
             logLines.clear()
-            isAsrDone = false
-            rawAsrResult = ""
-            diarizedResult = ""
-            showDiarizedView = false
             speakerTimelineResult = ""
             showSpeakerTimelineModal = false
             transcribedSegments = emptyList()
@@ -776,35 +671,7 @@ fun MainScreen(
             text = {
                 Column(modifier = Modifier.fillMaxWidth()) {
                     // Compact mode switch
-                    Row(
-                        modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = "Компактный режим",
-                                fontSize = 14.sp,
-                                fontWeight = FontWeight.Medium,
-                                color = MaterialTheme.colorScheme.onSurface
-                            )
-                            Text(
-                                text = "Скрывает кнопку «Распознать речь (old)», имя лог-файла и поле логов на главном экране",
-                                fontSize = 11.sp,
-                                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f)
-                            )
-                        }
-                        Spacer(Modifier.width(8.dp))
-                        Switch(
-                            checked = isCompactMode,
-                            onCheckedChange = { enabled ->
-                                isCompactMode = enabled
-                                prefs.edit().putBoolean("compact_mode", enabled).apply()
-                            }
-                        )
-                    }
 
-                    Divider(color = MaterialTheme.colorScheme.surfaceVariant, modifier = Modifier.padding(bottom = 8.dp))
 
                     Text(
                         text = "Порог кластеризации (clusterThreshold)",
@@ -966,17 +833,6 @@ fun MainScreen(
                 }
             }
 
-            if (logFileCreated && !isCompactMode) {
-                fileLogger?.let { logger ->
-                    Text(
-                        text = "📄 ${logger.getPath().substringAfterLast("/")}",
-                        fontSize = 10.sp,
-                        fontFamily = FontFamily.Monospace,
-                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.4f),
-                        modifier = Modifier.padding(bottom = 8.dp)
-                    )
-                }
-            }
 
             Divider(
                 color = MaterialTheme.colorScheme.surfaceVariant,
@@ -1197,65 +1053,6 @@ fun MainScreen(
                         }
                     }
 
-                    if (!isCompactMode) {
-                    Button(
-                        onClick = {
-                            val uri = selectedUri ?: return@Button
-                            isProcessing = true
-                            processingStartMs = System.currentTimeMillis()
-                            isAsrDone = false
-                            rawAsrResult = ""
-                            diarizedResult = ""
-                            showDiarizedView = false
-                            baseProgress = ""
-                            progress = "Подготовка..."
-                            result = ""
-                            error = ""
-                            logLines.clear()
-
-                            fileLogger?.log("=== ЗАПУСК ОБРАБОТКИ ===")
-                            fileLogger?.log("Файл: $selectedFilename, URI: $uri")
-
-                            onStartProcessing(
-                                uri,
-                                selectedFilename,
-                                fileLogger,
-                                { msg -> baseProgress = msg },
-                                { msg ->
-                                    logLines.add(msg)
-                                    fileLogger?.log(msg)
-                                },
-                                { text ->
-                                    result = text
-                                    rawAsrResult = text
-                                    diarizedResult = ""
-                                    showDiarizedView = false
-                                    isAsrDone = true
-                                    logLines.add("[PIPELINE] ✅ ASR завершён")
-                                    fileLogger?.log("ASR результат: \"${text.take(100)}...\"")
-                                    if (text.isEmpty() || text == "Речь не распознана") {
-                                        result = "Речь не распознана"
-                                        logLines.add("[РЕЗУЛЬТАТ] Речь не распознана")
-                                        fileLogger?.log("Речь не распознана")
-                                    }
-                                    isProcessing = false
-                                    fileLogger?.log("=== ОБРАБОТКА ЗАВЕРШЕНА ===")
-                                },
-                                { err ->
-                                    error = err
-                                    logLines.add("[ОШИБКА] $err")
-                                    fileLogger?.logError(err)
-                                    isProcessing = false
-                                    fileLogger?.log("=== ОБРАБОТКА ЗАВЕРШЕНА ===")
-                                }
-                            )
-                        },
-                        enabled = !isProcessing && !diarizationInProgress,
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text("▶ Распознать речь (old)")
-                    }
-                    }
                 }
 
                 if (isProcessing || diarizationInProgress || transcribingSegments) {
@@ -1272,120 +1069,34 @@ fun MainScreen(
                     )
                 }
 
-                // Log area
-                if (logLines.isNotEmpty() && !isCompactMode) {
-                    Spacer(Modifier.height(8.dp))
-                    Text(
-                        text = "📋 Текущая сессия (нажмите, чтобы скопировать)",
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f)
-                    )
-                    Spacer(Modifier.height(4.dp))
-                    Surface(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(133.dp)
-                            .verticalScroll(scrollState)
-                            .clickable {
-                                val fullLog = logLines.joinToString("\n")
-                                clipboardManager.setText(AnnotatedString(fullLog))
-                                Toast.makeText(context, "Логи скопированы!", Toast.LENGTH_SHORT).show()
-                            },
-                        color = Color(0xFF0D1117),
-                        shape = MaterialTheme.shapes.small
-                    ) {
-                        Text(
-                            text = logLines.joinToString("\n"),
-                            modifier = Modifier.padding(8.dp),
-                            fontSize = 11.sp,
-                            fontFamily = FontFamily.Monospace,
-                            lineHeight = 16.sp,
-                            color = Color(0xFF58A6FF),
-                            softWrap = true
-                        )
-                    }
-                }
-
                 if (result.isNotEmpty()) {
                     Spacer(Modifier.height(12.dp))
 
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    Button(
+                        onClick = {
+                            clipboardManager.setText(AnnotatedString(result))
+                            Toast.makeText(context, "Скопировано!", Toast.LENGTH_SHORT).show()
+                        },
+                        modifier = Modifier.fillMaxWidth()
                     ) {
-                        Button(
-                            onClick = {
-                                clipboardManager.setText(AnnotatedString(result))
-                                Toast.makeText(context, "Скопировано!", Toast.LENGTH_SHORT).show()
-                            },
-                            modifier = Modifier.weight(1f)
-                        ) {
-                            Text("📋 Копировать результат")
-                        }
-
-                        // Diarization buttons — only if ASR done
-                        if (isAsrDone && !isProcessing && !diarizationInProgress) {
-                            Button(
-                                onClick = {
-                                    diarizationInProgress = true
-                                    scope.launch {
-                                        logLines.add("[ДИАР.] Запускаю диаризацию...")
-                                        fileLogger?.log("=== ДИАРИЗАЦИЯ ===")
-                                        onStartDiarization(
-                                            result,
-                                            { msg -> baseProgress = msg },
-                                            { msg ->
-                                                logLines.add(msg)
-                                                fileLogger?.log(msg)
-                                            },
-                                            { diarResult ->
-                                                diarizedResult = diarResult
-                                                result = diarResult
-                                                showDiarizedView = true
-                                                logLines.add("[ДИАР.] ✅ Диаризация завершена")
-                                                fileLogger?.log("Диаризация завершена")
-                                                diarizationInProgress = false
-                                            },
-                                            { err ->
-                                                error = err
-                                                logLines.add("[ДИАР.] ❌ $err")
-                                                fileLogger?.logError(err)
-                                                diarizationInProgress = false
-                                            }
-                                        )
-                                    }
-                                },
-                                modifier = Modifier.weight(1f),
-                                colors = ButtonDefaults.buttonColors(
-                                    containerColor = MaterialTheme.colorScheme.tertiary
-                                )
-                            ) {
-                                Text("🗣 Разделить по спикерам")
-                            }
-                        }
+                        Text("📋 Копировать результат")
                     }
 
                     Spacer(Modifier.height(4.dp))
                     Text(
-                        text = "👇 Нажмите на текст для полноэкранного просмотра",
+                        text = "👇 Нажмите на текст для просмотра реплик",
                         fontSize = 11.sp,
                         color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.4f)
                     )
                     Spacer(Modifier.height(4.dp))
 
-                    // Clickable result preview — tap to open full-screen
-                    var showFullScreen by remember { mutableStateOf(false) }
-
                     Surface(
                         modifier = Modifier
                             .fillMaxWidth()
                             .weight(1f, fill = false)
-                            .clickable { 
+                            .clickable {
                                 if (transcribedSegments.isNotEmpty()) {
                                     showTranscribedModal = true
-                                } else {
-                                    showFullScreen = true 
                                 }
                             },
                         color = MaterialTheme.colorScheme.surfaceVariant,
@@ -1401,141 +1112,6 @@ fun MainScreen(
                             fontFamily = FontFamily.Monospace,
                             lineHeight = 22.sp,
                             color = MaterialTheme.colorScheme.onSurface
-                        )
-                    }
-
-                    // ===== FULL-SCREEN RESULT DIALOG =====
-                    if (showFullScreen) {
-                        AlertDialog(
-                            onDismissRequest = { showFullScreen = false },
-                            title = {
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.SpaceBetween,
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Text(
-                                        text = "📄 Результат",
-                                        color = MaterialTheme.colorScheme.primary,
-                                        fontWeight = FontWeight.Bold,
-                                        fontSize = 18.sp
-                                    )
-                                    IconButton(onClick = { showFullScreen = false }) {
-                                        Text("✕", fontSize = 20.sp, color = MaterialTheme.colorScheme.onSurface)
-                                    }
-                                }
-                            },
-                            text = {
-                                Column(modifier = Modifier.fillMaxWidth()) {
-                                    // Copy button at top
-                                    Button(
-                                        onClick = {
-                                            val copyText = if (showDiarizedView && diarizedResult.isNotEmpty()) diarizedResult else rawAsrResult
-                                            clipboardManager.setText(AnnotatedString(copyText))
-                                            Toast.makeText(context, "Весь текст скопирован!", Toast.LENGTH_SHORT).show()
-                                        },
-                                        modifier = Modifier.fillMaxWidth()
-                                    ) {
-                                        Text("📋 Копировать весь текст")
-                                    }
-
-                                    Spacer(Modifier.height(8.dp))
-
-                                    // ===== TOGGLE: Transcription vs Speakers =====
-                                    if (rawAsrResult.isNotEmpty()) {
-                                        Surface(
-                                            modifier = Modifier.fillMaxWidth(),
-                                            shape = MaterialTheme.shapes.small,
-                                            color = MaterialTheme.colorScheme.surfaceVariant
-                                        ) {
-                                            Row(
-                                                modifier = Modifier.fillMaxWidth(),
-                                                horizontalArrangement = Arrangement.Center
-                                            ) {
-                                                // Transcribe mode
-                                                TextButton(
-                                                    onClick = { showDiarizedView = false },
-                                                    modifier = Modifier.weight(1f),
-                                                    colors = ButtonDefaults.textButtonColors(
-                                                        containerColor = if (!showDiarizedView)
-                                                            MaterialTheme.colorScheme.primary.copy(alpha = 0.15f)
-                                                        else Color.Transparent
-                                                    )
-                                                ) {
-                                                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                                        Text("🎤", fontSize = 16.sp)
-                                                        Text(
-                                                            "Транскрибация",
-                                                            fontWeight = if (!showDiarizedView) FontWeight.Bold else FontWeight.Normal,
-                                                            fontSize = 11.sp
-                                                        )
-                                                    }
-                                                }
-                                                // Speakers mode
-                                                TextButton(
-                                                    onClick = { showDiarizedView = true },
-                                                    modifier = Modifier.weight(1f),
-                                                    enabled = diarizedResult.isNotEmpty(),
-                                                    colors = ButtonDefaults.textButtonColors(
-                                                        containerColor = if (showDiarizedView && diarizedResult.isNotEmpty())
-                                                            MaterialTheme.colorScheme.tertiary.copy(alpha = 0.15f)
-                                                        else Color.Transparent
-                                                    )
-                                                ) {
-                                                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                                        Text("🗣", fontSize = 16.sp)
-                                                        Text(
-                                                            "Спикеры",
-                                                            fontWeight = if (showDiarizedView && diarizedResult.isNotEmpty()) FontWeight.Bold else FontWeight.Normal,
-                                                            fontSize = 11.sp
-                                                        )
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        Spacer(Modifier.height(6.dp))
-                                    }
-
-                                    // Full-screen scrollable text — shows toggled content
-                                    val displayResult = if (showDiarizedView && diarizedResult.isNotEmpty()) diarizedResult else rawAsrResult
-
-                                    Surface(
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .height(420.dp)
-                                            .verticalScroll(rememberScrollState())
-                                            .clickable {
-                                                clipboardManager.setText(AnnotatedString(displayResult))
-                                                Toast.makeText(context, "Скопировано!", Toast.LENGTH_SHORT).show()
-                                            },
-                                        color = Color(0xFF0D1117),
-                                        shape = MaterialTheme.shapes.small
-                                    ) {
-                                        Text(
-                                            text = displayResult,
-                                            modifier = Modifier.padding(12.dp),
-                                            fontSize = 14.sp,
-                                            fontFamily = FontFamily.Monospace,
-                                            lineHeight = 22.sp,
-                                            color = Color(0xFFE0E0E0),
-                                            softWrap = true
-                                        )
-                                    }
-
-                                    Spacer(Modifier.height(4.dp))
-                                    Text(
-                                        text = "👆 Нажмите на текст, чтобы скопировать",
-                                        fontSize = 10.sp,
-                                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.4f)
-                                    )
-                                }
-                            },
-                            confirmButton = {
-                                TextButton(onClick = { showFullScreen = false }) {
-                                    Text("✕ Закрыть", fontSize = 14.sp)
-                                }
-                            },
-                            containerColor = MaterialTheme.colorScheme.background
                         )
                     }
 
