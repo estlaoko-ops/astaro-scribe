@@ -492,38 +492,61 @@ fun MainScreen(
                 selectedLog = null
             },
             title = {
-                Text(
-                    text = if (selectedLog != null) "📄 ${selectedLog!!.first}" else "📋 Сохранённые логи",
-                    color = MaterialTheme.colorScheme.primary
-                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = if (selectedLog != null) "📄 ${selectedLog!!.first}" else "📋 Логи",
+                        color = MaterialTheme.colorScheme.primary,
+                        fontWeight = FontWeight.Bold
+                    )
+                    if (selectedLog != null) {
+                        TextButton(
+                            onClick = { selectedLog = null },
+                            contentPadding = PaddingValues(horizontal = 4.dp)
+                        ) { Text("← Назад", fontSize = 12.sp) }
+                    }
+                }
             },
             text = {
                 if (selectedLog != null) {
+                    // ===== SELECTED LOG VIEW =====
                     Column {
-                        Text(
-                            text = "Нажмите, чтобы скопировать",
-                            fontSize = 11.sp,
-                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f),
-                            modifier = Modifier.padding(bottom = 4.dp)
-                        )
-                        val isTruncated = selectedLog!!.second.length > 3000
+                        val isTruncated = selectedLog!!.second.length > 4000
                         val displayText = if (isTruncated)
-                            "... (показаны последние 3000 символов)\n\n${
-                                selectedLog!!.second.takeLast(3000)
-                            }"
+                            "... (последние 4000 символов)\n\n${selectedLog!!.second.takeLast(4000)}"
                         else
                             selectedLog!!.second
-
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(bottom = 4.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "👆 Тап — скопировать",
+                                fontSize = 10.sp,
+                                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.4f)
+                            )
+                            if (isTruncated) {
+                                TextButton(
+                                    onClick = {
+                                        clipboardManager.setText(AnnotatedString(selectedLog!!.second))
+                                        Toast.makeText(context, "Весь лог скопирован!", Toast.LENGTH_SHORT).show()
+                                    },
+                                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp)
+                                ) { Text("📋 Копировать всё", fontSize = 10.sp) }
+                            }
+                        }
                         Surface(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .height(400.dp)
+                                .height(420.dp)
                                 .verticalScroll(rememberScrollState())
                                 .clickable {
                                     clipboardManager.setText(AnnotatedString(displayText))
-                                    Toast
-                                        .makeText(context, "Скопировано то, что на экране!", Toast.LENGTH_SHORT)
-                                        .show()
+                                    Toast.makeText(context, "Скопировано!", Toast.LENGTH_SHORT).show()
                                 },
                             color = Color(0xFF0D1117),
                             shape = MaterialTheme.shapes.small
@@ -538,91 +561,127 @@ fun MainScreen(
                                 softWrap = true
                             )
                         }
-                        Spacer(Modifier.height(4.dp))
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Text(
-                                text = "👆 Тап — скопировать экран",
-                                fontSize = 10.sp,
-                                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.4f)
-                            )
-                            if (isTruncated) {
-                                TextButton(
-                                    onClick = {
-                                        clipboardManager.setText(AnnotatedString(selectedLog!!.second))
-                                        Toast.makeText(context, "Весь лог скопирован!", Toast.LENGTH_SHORT).show()
-                                    },
-                                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp)
-                                ) {
-                                    Text(
-                                        text = "📋 Копировать всё",
-                                        fontSize = 10.sp
-                                    )
-                                }
-                            }
-                        }
-                    }
-                } else if (previousLogs.isEmpty()) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Text(
-                            text = "Нет сохранённых логов от предыдущих запусков.",
-                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f)
-                        )
-                        Spacer(Modifier.height(8.dp))
-                        Text(
-                            text = "Логи появляются после обработки аудио.",
-                            fontSize = 12.sp,
-                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f)
-                        )
                     }
                 } else {
-                    Column {
-                        Text(
-                            text = "Выберите лог, чтобы посмотреть его содержимое:",
-                            fontSize = 12.sp,
-                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f),
-                            modifier = Modifier.padding(bottom = 8.dp)
-                        )
-                        previousLogs.forEach { log ->
-                            Card(
+                    // ===== LOGS LIST VIEW =====
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 480.dp)
+                            .verticalScroll(rememberScrollState())
+                    ) {
+                        // Current session logs
+                        if (logLines.isNotEmpty()) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(bottom = 4.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "Текущая сессия",
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.primary
+                                )
+                                TextButton(
+                                    onClick = {
+                                        clipboardManager.setText(AnnotatedString(logLines.joinToString("\n")))
+                                        Toast.makeText(context, "Лог скопирован!", Toast.LENGTH_SHORT).show()
+                                    },
+                                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp)
+                                ) { Text("📋 Копировать", fontSize = 11.sp) }
+                            }
+                            Surface(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .padding(vertical = 3.dp)
+                                    .heightIn(max = 220.dp)
+                                    .verticalScroll(rememberScrollState())
                                     .clickable {
-                                        selectedLog = Pair(
-                                            "${log.date} — ${log.name}",
-                                            log.content
-                                        )
+                                        clipboardManager.setText(AnnotatedString(logLines.joinToString("\n")))
+                                        Toast.makeText(context, "Лог скопирован!", Toast.LENGTH_SHORT).show()
                                     },
-                                colors = CardDefaults.cardColors(
-                                    containerColor = if (log.name.contains("CRASH"))
-                                        MaterialTheme.colorScheme.error.copy(alpha = 0.15f)
-                                    else
-                                        MaterialTheme.colorScheme.surfaceVariant
-                                )
+                                color = Color(0xFF0D1117),
+                                shape = MaterialTheme.shapes.small
                             ) {
-                                Row(
-                                    modifier = Modifier.padding(10.dp),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Text(
-                                        text = if (log.name.contains("CRASH")) "💥" else "📄",
-                                        fontSize = 16.sp
+                                Text(
+                                    text = logLines.joinToString("\n"),
+                                    modifier = Modifier.padding(8.dp),
+                                    fontSize = 10.sp,
+                                    fontFamily = FontFamily.Monospace,
+                                    lineHeight = 14.sp,
+                                    color = Color(0xFF58A6FF),
+                                    softWrap = true
+                                )
+                            }
+                        } else {
+                            Surface(
+                                modifier = Modifier.fillMaxWidth().padding(bottom = 4.dp),
+                                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f),
+                                shape = MaterialTheme.shapes.small
+                            ) {
+                                Text(
+                                    text = "Текущая сессия: логов пока нет. Выберите файл и запустите обработку.",
+                                    fontSize = 11.sp,
+                                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f),
+                                    modifier = Modifier.padding(10.dp)
+                                )
+                            }
+                        }
+
+                        // Previous sessions
+                        if (previousLogs.isNotEmpty()) {
+                            Divider(
+                                color = MaterialTheme.colorScheme.surfaceVariant,
+                                modifier = Modifier.padding(vertical = 10.dp)
+                            )
+                            Text(
+                                text = "Предыдущие сессии",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
+                                modifier = Modifier.padding(bottom = 6.dp)
+                            )
+                            previousLogs.forEach { log ->
+                                Card(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(vertical = 3.dp)
+                                        .clickable {
+                                            selectedLog = Pair("${log.date} — ${log.name}", log.content)
+                                        },
+                                    colors = CardDefaults.cardColors(
+                                        containerColor = if (log.name.contains("CRASH"))
+                                            MaterialTheme.colorScheme.error.copy(alpha = 0.15f)
+                                        else
+                                            MaterialTheme.colorScheme.surfaceVariant
                                     )
-                                    Spacer(Modifier.width(8.dp))
-                                    Column {
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(10.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
                                         Text(
-                                            text = log.date,
-                                            fontSize = 11.sp,
-                                            fontWeight = FontWeight.Bold,
-                                            color = MaterialTheme.colorScheme.onSurface
+                                            text = if (log.name.contains("CRASH")) "💥" else "📄",
+                                            fontSize = 16.sp
                                         )
+                                        Spacer(Modifier.width(8.dp))
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Text(
+                                                text = log.date,
+                                                fontSize = 11.sp,
+                                                fontWeight = FontWeight.Bold,
+                                                color = MaterialTheme.colorScheme.onSurface
+                                            )
+                                            Text(
+                                                text = log.name,
+                                                fontSize = 10.sp,
+                                                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f)
+                                            )
+                                        }
                                         Text(
-                                            text = log.name,
-                                            fontSize = 10.sp,
-                                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f)
+                                            text = "→",
+                                            fontSize = 14.sp,
+                                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.3f)
                                         )
                                     }
                                 }
@@ -632,19 +691,14 @@ fun MainScreen(
                 }
             },
             confirmButton = {
-                if (selectedLog != null) {
-                    TextButton(onClick = { selectedLog = null }) {
-                        Text("← Назад")
-                    }
-                } else {
-                    TextButton(onClick = {
-                        showLogsDialog = false
-                        selectedLog = null
-                    }) {
-                        Text("Закрыть")
-                    }
+                TextButton(onClick = {
+                    showLogsDialog = false
+                    selectedLog = null
+                }) {
+                    Text("Закрыть")
                 }
-            }
+            },
+            containerColor = MaterialTheme.colorScheme.background
         )
     }
 
@@ -873,7 +927,7 @@ fun MainScreen(
                         color = MaterialTheme.colorScheme.primary
                     )
                     Text(
-                        text = "v6.8 · Hittite · Whisper Small INT8",
+                        text = "v6.8 · Hittite · ${if (remoteAsrEnabled) "Whisper Turbo (сервер)" else "Whisper Small INT8"}",
                         fontSize = 11.sp,
                         color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f),
                         modifier = Modifier.padding(bottom = 4.dp)
