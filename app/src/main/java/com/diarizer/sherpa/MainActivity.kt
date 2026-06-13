@@ -375,6 +375,7 @@ fun MainScreen(
     // Version history dialog
     var showVersionHistory by remember { mutableStateOf(false) }
     val versionHistory = listOf(
+        "v6.9 · Phoenicia · Whisper Small INT8 · Astaro",
         "v6.8 · Hittite · Whisper Small INT8 · Astaro",
         "v6.7 · Assyria · Whisper Small INT8",
         "v6.6 · Babylon · Whisper Small INT8",
@@ -927,7 +928,7 @@ fun MainScreen(
                         color = MaterialTheme.colorScheme.primary
                     )
                     Text(
-                        text = "v6.8 · Hittite · ${if (remoteAsrEnabled) "Whisper Turbo (сервер)" else "Whisper Small INT8"}",
+                        text = "v6.9 · Phoenicia · ${if (remoteAsrEnabled) "Whisper Turbo (сервер)" else "Whisper Small INT8"}",
                         fontSize = 11.sp,
                         color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f),
                         modifier = Modifier.padding(bottom = 4.dp)
