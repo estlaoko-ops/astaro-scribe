@@ -9,9 +9,11 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Settings
@@ -25,6 +27,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.documentfile.provider.DocumentFile
@@ -166,17 +169,18 @@ class MainActivity : ComponentActivity() {
 }
 
 private val DarkColorScheme = darkColorScheme(
-    primary = Color(0xFF90CAF9),
-    secondary = Color(0xFFCE93D8),
-    tertiary = Color(0xFFA5D6A7),
-    background = Color(0xFF1A1A2E),
-    surface = Color(0xFF16213E),
-    surfaceVariant = Color(0xFF0F3460),
-    onPrimary = Color.Black,
-    onSecondary = Color.Black,
-    onBackground = Color(0xFFE0E0E0),
-    onSurface = Color(0xFFE0E0E0),
-    onSurfaceVariant = Color(0xFFB0BEC5),
+    primary = Color(0xFF818CF8),
+    secondary = Color(0xFFA78BFA),
+    tertiary = Color(0xFF34D399),
+    error = Color(0xFFF87171),
+    background = Color(0xFF060D1A),
+    surface = Color(0xFF0C1829),
+    surfaceVariant = Color(0xFF162438),
+    onPrimary = Color(0xFF1E1B4B),
+    onSecondary = Color(0xFF2E1065),
+    onBackground = Color(0xFFE2E8F0),
+    onSurface = Color(0xFFE2E8F0),
+    onSurfaceVariant = Color(0xFF94A3B8),
 )
 
 @Composable
@@ -775,71 +779,59 @@ fun MainScreen(
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(16.dp),
-            verticalArrangement = Arrangement.Top,
-            horizontalAlignment = Alignment.CenterHorizontally
+                .padding(horizontal = 20.dp)
+                .padding(top = 20.dp, bottom = 12.dp),
+            verticalArrangement = Arrangement.Top
         ) {
             // ===== HEADER =====
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                verticalAlignment = Alignment.CenterVertically
             ) {
                 Column(
-                    modifier = Modifier.weight(1f).clickable { showVersionHistory = true }
+                    modifier = Modifier
+                        .weight(1f)
+                        .clickable { showVersionHistory = true }
                 ) {
                     Text(
-                        text = "🎙 Astaro",
-                        fontSize = 24.sp,
+                        text = "Astaro",
+                        fontSize = 26.sp,
                         fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.primary
+                        color = MaterialTheme.colorScheme.onBackground,
+                        letterSpacing = (-0.5f).sp
                     )
                     Text(
-                        text = "v6.9 · Phoenicia · ${if (remoteAsrEnabled) "Whisper Turbo (сервер)" else "Whisper Small INT8"}",
+                        text = "v6.9 · Phoenicia",
                         fontSize = 11.sp,
-                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f),
-                        modifier = Modifier.padding(bottom = 4.dp)
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
-                // Settings button
-                Button(
-                    onClick = { showSettingsDialog = true },
-                    modifier = Modifier.size(40.dp),
-                    contentPadding = PaddingValues(0.dp),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = MaterialTheme.colorScheme.surfaceVariant
-                    )
-                ) {
+                IconButton(onClick = { showSettingsDialog = true }) {
                     Icon(
                         imageVector = Icons.Default.Settings,
                         contentDescription = "Настройки",
-                        tint = Color.White
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(22.dp)
                     )
                 }
-                // Small log button top-right
-                Button(
+                IconButton(
                     onClick = {
                         fileLogger?.let { previousLogs = it.getPreviousLogs() }
                         showLogsDialog = true
                         selectedLog = null
-                    },
-                    modifier = Modifier.size(40.dp),
-                    contentPadding = PaddingValues(0.dp),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = MaterialTheme.colorScheme.surfaceVariant
-                    )
+                    }
                 ) {
-                    Text(text = "📋", fontSize = 14.sp)
+                    Text(
+                        text = "≡",
+                        fontSize = 20.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
                 }
             }
 
+            Spacer(Modifier.height(20.dp))
 
-            Divider(
-                color = MaterialTheme.colorScheme.surfaceVariant,
-                modifier = Modifier.padding(bottom = 12.dp)
-            )
-
-            // Error display
+            // ===== ERROR CARD =====
             if (error.isNotEmpty()) {
                 Card(
                     modifier = Modifier
@@ -847,171 +839,280 @@ fun MainScreen(
                         .padding(bottom = 12.dp)
                         .clickable {
                             clipboardManager.setText(AnnotatedString(error))
-                            Toast.makeText(context, "Текст ошибки скопирован!", Toast.LENGTH_SHORT).show()
+                            Toast.makeText(context, "Скопировано!", Toast.LENGTH_SHORT).show()
                         },
+                    shape = RoundedCornerShape(12.dp),
                     colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.error.copy(alpha = 0.2f)
-                    )
+                        containerColor = MaterialTheme.colorScheme.error.copy(alpha = 0.10f)
+                    ),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.error.copy(alpha = 0.35f))
                 ) {
                     Text(
-                        text = "[нажмите, чтобы скопировать]\n$error",
+                        text = error,
                         color = MaterialTheme.colorScheme.error,
-                        fontSize = 11.sp,
+                        fontSize = 12.sp,
                         modifier = Modifier.padding(12.dp)
                     )
                 }
             }
 
-            // ===== DOWNLOAD MODELS =====
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                if (!isInitialized && !isDownloading) {
-                    Button(
-                        onClick = {
-                            context.startService(Intent(context, TranscriberService::class.java))
-                            isDownloading = true
-                            scope.launch {
-                                try {
-                                    fileLogger?.log("=== ЗАГРУЗКА МОДЕЛЕЙ ===")
-                                    ModelDownloader.downloadModels(context) { msg, _ ->
-                                        downloadProgress = msg
-                                        fileLogger?.log("[DL] $msg")
-                                    }
-                                    fileLogger?.log("Загрузка завершена, инициализирую...")
-
-                                    val success = withContext(Dispatchers.IO) {
-                                        pipeline?.loadModels() ?: false
-                                    }
-                                    isInitialized = success
-                                    isDownloading = false
-                                    downloadProgress = ""
-
-                                    if (success) {
-                                        logLines.add("[СИСТЕМА] ✅ Whisper Small INT8 + ML-диаризация (бета) готовы")
-                                        fileLogger?.log("✅ Whisper Small INT8 + ML-диаризация (бета) готовы")
-
-                                        Toast.makeText(context, "Модели загружены!", Toast.LENGTH_SHORT).show()
-                                    } else {
-                                        error = "Не удалось загрузить модели"
-                                        fileLogger?.logError("Не удалось загрузить модели")
-                                    }
-                                } catch (e: Exception) {
-                                    error = "Ошибка загрузки: ${e.message}"
-                                    fileLogger?.logError("Ошибка загрузки", e)
-                                    isDownloading = false
-                                    downloadProgress = ""
-                                } finally {
-                                    context.stopService(Intent(context, TranscriberService::class.java))
-                                }
-                            }
-                        },
-                        modifier = Modifier.weight(2f)
-                    ) {
-                        Text("📥 Загрузить модели (~358 МБ)", fontSize = 13.sp)
-                    }
-                }
-            }
-
-            if (isDownloading && downloadProgress.isNotEmpty()) {
-                Spacer(Modifier.height(8.dp))
-                LinearProgressIndicator(
-                    modifier = Modifier.fillMaxWidth(),
-                    color = MaterialTheme.colorScheme.primary
-                )
-                Spacer(Modifier.height(4.dp))
-                Text(
-                    text = downloadProgress,
-                    fontSize = 13.sp,
-                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f)
-                )
-            }
-
             val isReady = isInitialized || remoteAsrEnabled
-            if (isReady) {
-                Text(
-                    text = if (remoteAsrEnabled)
-                        "✅ Whisper Turbo (сервер) + ML-диаризация (бета)"
-                    else
-                        "✅ Whisper Small INT8 + ML-диаризация (бета)",
-                    fontSize = 12.sp,
-                    color = MaterialTheme.colorScheme.tertiary.copy(alpha = 0.7f),
-                    modifier = Modifier.padding(top = 4.dp, bottom = 4.dp)
-                )
 
-                // File select + Play in one row
-                var isPlaying by remember { mutableStateOf(false) }
-                val mediaPlayer = remember { mutableStateOf<android.media.MediaPlayer?>(null) }
-
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Button(
-                        onClick = {
-                            filePickerLauncher.launch(arrayOf("audio/*"))
-                        },
-                        enabled = !isProcessing && !diarizationInProgress,
-                        modifier = Modifier.weight(1f)
+            // ===== DOWNLOAD STATE =====
+            if (!isReady) {
+                Spacer(Modifier.height(8.dp))
+                if (isDownloading) {
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(20.dp),
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.surfaceVariant)
                     ) {
-                        Text("📂 Выбрать аудио", fontSize = 13.sp)
-                    }
-
-                    if (selectedFilename.isNotEmpty()) {
-                        Button(
-                            onClick = {
-                                if (isPlaying) {
-                                    mediaPlayer.value?.stop()
-                                    mediaPlayer.value?.release()
-                                    mediaPlayer.value = null
-                                    isPlaying = false
-                                } else {
-                                    val uri = selectedUri ?: return@Button
-                                    try {
-                                        val mp = android.media.MediaPlayer()
-                                        mp.setDataSource(context, uri)
-                                        mp.setOnCompletionListener {
-                                            mp.release()
-                                            mediaPlayer.value = null
-                                            isPlaying = false
-                                        }
-                                        mp.setOnErrorListener { _, _, _ ->
-                                            mp.release()
-                                            mediaPlayer.value = null
-                                            isPlaying = false
-                                            true
-                                        }
-                                        mp.prepare()
-                                        mp.start()
-                                        mediaPlayer.value = mp
-                                        isPlaying = true
-                                    } catch (e: Exception) {
-                                        Toast.makeText(context, "Не удалось воспроизвести", Toast.LENGTH_SHORT).show()
-                                    }
-                                }
-                            },
-                            enabled = !isProcessing && !diarizationInProgress,
-                            modifier = Modifier.weight(1f),
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = if (isPlaying) Color(0xFFEF5350) else MaterialTheme.colorScheme.secondary
+                        Column(modifier = Modifier.padding(20.dp)) {
+                            Text(
+                                text = "Загрузка моделей...",
+                                fontWeight = FontWeight.SemiBold,
+                                fontSize = 15.sp,
+                                color = MaterialTheme.colorScheme.onSurface
                             )
-                        ) {
-                            Text(if (isPlaying) "⏹" else "▶ Проверить", fontSize = 13.sp)
+                            Spacer(Modifier.height(4.dp))
+                            Text(
+                                text = downloadProgress,
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Spacer(Modifier.height(14.dp))
+                            LinearProgressIndicator(
+                                modifier = Modifier.fillMaxWidth(),
+                                color = MaterialTheme.colorScheme.primary,
+                                trackColor = MaterialTheme.colorScheme.surfaceVariant
+                            )
+                        }
+                    }
+                } else {
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(20.dp),
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.surfaceVariant)
+                    ) {
+                        Column(modifier = Modifier.padding(20.dp)) {
+                            Text(
+                                text = "Необходимы модели",
+                                fontWeight = FontWeight.SemiBold,
+                                fontSize = 15.sp,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                            Spacer(Modifier.height(4.dp))
+                            Text(
+                                text = "Whisper Small INT8 + ML-диаризация · ~358 МБ",
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Spacer(Modifier.height(16.dp))
+                            Button(
+                                onClick = {
+                                    context.startService(Intent(context, TranscriberService::class.java))
+                                    isDownloading = true
+                                    scope.launch {
+                                        try {
+                                            fileLogger?.log("=== ЗАГРУЗКА МОДЕЛЕЙ ===")
+                                            ModelDownloader.downloadModels(context) { msg, _ ->
+                                                downloadProgress = msg
+                                                fileLogger?.log("[DL] $msg")
+                                            }
+                                            val success = withContext(Dispatchers.IO) {
+                                                pipeline?.loadModels() ?: false
+                                            }
+                                            isInitialized = success
+                                            isDownloading = false
+                                            downloadProgress = ""
+                                            if (success) {
+                                                logLines.add("[СИСТЕМА] ✅ Готово")
+                                                fileLogger?.log("Модели загружены")
+                                                Toast.makeText(context, "Модели загружены!", Toast.LENGTH_SHORT).show()
+                                            } else {
+                                                error = "Не удалось загрузить модели"
+                                                fileLogger?.logError("Не удалось загрузить модели")
+                                            }
+                                        } catch (e: Exception) {
+                                            error = "Ошибка загрузки: ${e.message}"
+                                            fileLogger?.logError("Ошибка загрузки", e)
+                                            isDownloading = false
+                                            downloadProgress = ""
+                                        } finally {
+                                            context.stopService(Intent(context, TranscriberService::class.java))
+                                        }
+                                    }
+                                },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(48.dp),
+                                shape = RoundedCornerShape(12.dp)
+                            ) {
+                                Text("Загрузить модели", fontWeight = FontWeight.Medium)
+                            }
                         }
                     }
                 }
+            }
 
-                if (selectedFilename.isNotEmpty()) {
-                    Text(
-                        text = "Файл: $selectedFilename",
-                        fontSize = 14.sp,
-                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f),
-                        modifier = Modifier.padding(vertical = 8.dp)
-                    )
+            // ===== READY STATE =====
+            if (isReady) {
+                // Mode pill
+                Surface(
+                    shape = RoundedCornerShape(20.dp),
+                    color = MaterialTheme.colorScheme.tertiary.copy(alpha = 0.10f),
+                    modifier = Modifier.padding(bottom = 16.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Surface(
+                            modifier = Modifier.size(6.dp),
+                            shape = RoundedCornerShape(3.dp),
+                            color = MaterialTheme.colorScheme.tertiary
+                        ) {}
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            text = if (remoteAsrEnabled) "Whisper Turbo (сервер)" else "Whisper Small INT8",
+                            fontSize = 11.sp,
+                            color = MaterialTheme.colorScheme.tertiary,
+                            fontWeight = FontWeight.Medium
+                        )
+                    }
+                }
 
-                    // Alpha button — сразу при выборе файла (временная для тестов)
-                    if (!isProcessing && !diarizationInProgress) {
+                var isPlaying by remember { mutableStateOf(false) }
+                val mediaPlayer = remember { mutableStateOf<android.media.MediaPlayer?>(null) }
+
+                // ===== FILE AREA =====
+                if (selectedFilename.isEmpty()) {
+                    // Upload zone
+                    Card(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(148.dp)
+                            .clickable(enabled = !isProcessing && !diarizationInProgress) {
+                                filePickerLauncher.launch(arrayOf("audio/*"))
+                            },
+                        shape = RoundedCornerShape(20.dp),
+                        colors = CardDefaults.cardColors(containerColor = Color.Transparent),
+                        border = BorderStroke(1.5.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.22f))
+                    ) {
+                        Column(
+                            modifier = Modifier.fillMaxSize(),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.Center
+                        ) {
+                            Text(
+                                text = "+",
+                                fontSize = 34.sp,
+                                fontWeight = FontWeight.Light,
+                                color = MaterialTheme.colorScheme.primary.copy(alpha = 0.6f)
+                            )
+                            Spacer(Modifier.height(6.dp))
+                            Text(
+                                text = "Выбрать аудио",
+                                fontSize = 15.sp,
+                                fontWeight = FontWeight.Medium,
+                                color = MaterialTheme.colorScheme.onBackground
+                            )
+                            Spacer(Modifier.height(3.dp))
+                            Text(
+                                text = "MP3 · WAV · M4A · OGG · MP4",
+                                fontSize = 11.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                } else {
+                    // File card
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(16.dp),
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.surfaceVariant)
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(12.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Surface(
+                                modifier = Modifier.size(42.dp),
+                                shape = RoundedCornerShape(10.dp),
+                                color = MaterialTheme.colorScheme.primary.copy(alpha = 0.10f)
+                            ) {
+                                Box(contentAlignment = Alignment.Center) {
+                                    Text("🎵", fontSize = 18.sp)
+                                }
+                            }
+                            Spacer(Modifier.width(12.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = selectedFilename,
+                                    fontWeight = FontWeight.Medium,
+                                    fontSize = 13.sp,
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Text(
+                                    text = "нажмите ▶ для прослушивания",
+                                    fontSize = 11.sp,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            IconButton(
+                                onClick = {
+                                    if (isPlaying) {
+                                        mediaPlayer.value?.stop()
+                                        mediaPlayer.value?.release()
+                                        mediaPlayer.value = null
+                                        isPlaying = false
+                                    } else {
+                                        val uri = selectedUri ?: return@IconButton
+                                        try {
+                                            val mp = android.media.MediaPlayer()
+                                            mp.setDataSource(context, uri)
+                                            mp.setOnCompletionListener {
+                                                mp.release(); mediaPlayer.value = null; isPlaying = false
+                                            }
+                                            mp.setOnErrorListener { _, _, _ ->
+                                                mp.release(); mediaPlayer.value = null; isPlaying = false; true
+                                            }
+                                            mp.prepare(); mp.start()
+                                            mediaPlayer.value = mp; isPlaying = true
+                                        } catch (_: Exception) {
+                                            Toast.makeText(context, "Ошибка воспроизведения", Toast.LENGTH_SHORT).show()
+                                        }
+                                    }
+                                },
+                                enabled = !isProcessing && !diarizationInProgress
+                            ) {
+                                Text(
+                                    text = if (isPlaying) "⏹" else "▶",
+                                    fontSize = 16.sp,
+                                    color = if (isPlaying) MaterialTheme.colorScheme.error
+                                            else MaterialTheme.colorScheme.secondary
+                                )
+                            }
+                            IconButton(
+                                onClick = { filePickerLauncher.launch(arrayOf("audio/*")) },
+                                enabled = !isProcessing && !diarizationInProgress
+                            ) {
+                                Text("↩", fontSize = 16.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                        }
+                    }
+
+                    Spacer(Modifier.height(12.dp))
+
+                    // ===== ACTION BUTTON =====
+                    if (!isProcessing && !diarizationInProgress && !transcribingSegments) {
                         Button(
                             onClick = {
                                 diarizationInProgress = true
@@ -1044,78 +1145,124 @@ fun MainScreen(
                                     }
                                 )
                             },
-                            modifier = Modifier.fillMaxWidth().padding(bottom = 4.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(56.dp),
+                            shape = RoundedCornerShape(16.dp),
                             colors = ButtonDefaults.buttonColors(
-                                containerColor = Color(0xFF2EA043)
+                                containerColor = Color(0xFF4F46E5)
                             )
                         ) {
-                            Text("🔬 Разделить на спикеров (New)", fontSize = 12.sp, color = Color.White)
+                            Text(
+                                text = "Разделить на спикеров",
+                                fontWeight = FontWeight.SemiBold,
+                                fontSize = 15.sp
+                            )
+                        }
+                    }
+                }
+
+                // ===== PROCESSING CARD =====
+                if (isProcessing || diarizationInProgress || transcribingSegments) {
+                    Spacer(Modifier.height(16.dp))
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(16.dp),
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.surfaceVariant)
+                    ) {
+                        Column(modifier = Modifier.padding(16.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = baseProgress.ifEmpty { "Обработка..." },
+                                    fontWeight = FontWeight.Medium,
+                                    fontSize = 13.sp,
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                    modifier = Modifier.weight(1f),
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                val timerStr = progress.substringAfterLast("⏱", "").trim()
+                                if (timerStr.isNotEmpty()) {
+                                    Text(
+                                        text = "⏱ $timerStr",
+                                        fontSize = 12.sp,
+                                        color = MaterialTheme.colorScheme.primary,
+                                        fontFamily = FontFamily.Monospace
+                                    )
+                                }
+                            }
+                            Spacer(Modifier.height(10.dp))
+                            LinearProgressIndicator(
+                                modifier = Modifier.fillMaxWidth(),
+                                color = MaterialTheme.colorScheme.primary,
+                                trackColor = MaterialTheme.colorScheme.surfaceVariant
+                            )
+                        }
+                    }
+                }
+
+                // ===== RESULT CARD =====
+                if (result.isNotEmpty()) {
+                    Spacer(Modifier.height(16.dp))
+                    Card(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .weight(1f, fill = false),
+                        shape = RoundedCornerShape(16.dp),
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFF080F1E)),
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.surfaceVariant)
+                    ) {
+                        Column(modifier = Modifier.padding(16.dp)) {
+                            Text(
+                                text = result,
+                                fontSize = 13.sp,
+                                fontFamily = FontFamily.Monospace,
+                                lineHeight = 21.sp,
+                                color = Color(0xFFCDD5E0),
+                                modifier = Modifier
+                                    .weight(1f, fill = false)
+                                    .verticalScroll(rememberScrollState())
+                            )
+                            HorizontalDivider(
+                                modifier = Modifier.padding(vertical = 10.dp),
+                                color = MaterialTheme.colorScheme.surfaceVariant
+                            )
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Button(
+                                    onClick = {
+                                        clipboardManager.setText(AnnotatedString(result))
+                                        Toast.makeText(context, "Скопировано!", Toast.LENGTH_SHORT).show()
+                                    },
+                                    modifier = Modifier.weight(1f).height(40.dp),
+                                    shape = RoundedCornerShape(10.dp),
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = MaterialTheme.colorScheme.surfaceVariant
+                                    )
+                                ) {
+                                    Text("Копировать", fontSize = 13.sp)
+                                }
+                                if (transcribedSegments.isNotEmpty()) {
+                                    Button(
+                                        onClick = { showTranscribedModal = true },
+                                        modifier = Modifier.weight(1f).height(40.dp),
+                                        shape = RoundedCornerShape(10.dp),
+                                        colors = ButtonDefaults.buttonColors(
+                                            containerColor = Color(0xFF4F46E5)
+                                        )
+                                    ) {
+                                        Text("Реплики", fontSize = 13.sp)
+                                    }
+                                }
+                            }
                         }
                     }
 
-                }
-
-                if (isProcessing || diarizationInProgress || transcribingSegments) {
-                    Spacer(Modifier.height(12.dp))
-                    LinearProgressIndicator(
-                        modifier = Modifier.fillMaxWidth(),
-                        color = MaterialTheme.colorScheme.primary
-                    )
-                    Spacer(Modifier.height(4.dp))
-                    Text(
-                        text = progress,
-                        fontSize = 14.sp,
-                        color = MaterialTheme.colorScheme.primary
-                    )
-                }
-
-                if (result.isNotEmpty()) {
-                    Spacer(Modifier.height(12.dp))
-
-                    Button(
-                        onClick = {
-                            clipboardManager.setText(AnnotatedString(result))
-                            Toast.makeText(context, "Скопировано!", Toast.LENGTH_SHORT).show()
-                        },
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text("📋 Копировать результат")
-                    }
-
-                    Spacer(Modifier.height(4.dp))
-                    Text(
-                        text = "👇 Нажмите на текст для просмотра реплик",
-                        fontSize = 11.sp,
-                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.4f)
-                    )
-                    Spacer(Modifier.height(4.dp))
-
-                    Surface(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .weight(1f, fill = false)
-                            .clickable {
-                                if (transcribedSegments.isNotEmpty()) {
-                                    showTranscribedModal = true
-                                }
-                            },
-                        color = MaterialTheme.colorScheme.surfaceVariant,
-                        shape = MaterialTheme.shapes.medium,
-                        tonalElevation = 2.dp
-                    ) {
-                        Text(
-                            text = result,
-                            modifier = Modifier
-                                .padding(12.dp)
-                                .verticalScroll(rememberScrollState()),
-                            fontSize = 14.sp,
-                            fontFamily = FontFamily.Monospace,
-                            lineHeight = 22.sp,
-                            color = MaterialTheme.colorScheme.onSurface
-                        )
-                    }
-
-                    // ===== SPEAKER TIMELINE MODAL with player =====
+                                        // ===== SPEAKER TIMELINE MODAL with player =====
                     if (showSpeakerTimelineModal && speakerTimelineResult.isNotEmpty()) {
                         AlertDialog(
                             onDismissRequest = { showSpeakerTimelineModal = false },
