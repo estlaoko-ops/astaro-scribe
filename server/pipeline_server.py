@@ -1,122 +1,70 @@
 """
-Astaro Scribe — Pipeline Server
-Добавь этот файл к существующему Flask-серверу:
+Astaro Scribe — Pipeline Gateway
+Оркестрирует существующие сервисы: diarization-gateway + whisper-gateway.
 
-    from pipeline_server import pipeline_bp
-    app.register_blueprint(pipeline_bp)
+Развёрнуто по адресу: /opt/apps/local-models/pipeline-gateway/server.py
 
-Или запусти standalone:
-    python pipeline_server.py
+Сервис:
+    POST /pipeline/submit   — принять аудиофайл, вернуть {"job_id": "..."}
+    GET  /pipeline/status/<job_id> — статус + результат
 
-Требования (pip install):
-    pyannote.audio==3.1.*
-    faster-whisper
-    torch  (уже должен быть)
-    ffmpeg  (системный: apt install ffmpeg)
+Вызывает:
+    diarization-gateway:8070/diarize  — Pyannote speaker diarization
+    whisper-gateway:8050/transcribe   — Whisper Turbo per-segment
 
-Переменные окружения:
-    HF_TOKEN    — HuggingFace токен (нужен для pyannote/speaker-diarization-3.1)
-    WHISPER_MODEL — имя модели (по умолчанию: large-v3-turbo)
-    WHISPER_LANG  — язык (по умолчанию: ru; поставь "" для авто-определения)
+Поднять / обновить на сервере:
+    ssh root@2.25.155.237
+    cd /opt/apps/local-models/pipeline-gateway
+    docker compose build --no-cache && docker compose up -d
 """
 
+from flask import Flask, request, jsonify
 import os
-import uuid
-import threading
-import tempfile
+import requests
 import subprocess
-import wave
-import logging
-from functools import wraps
-from flask import Flask, Blueprint, request, jsonify
+import tempfile
+import threading
+import time
+import uuid
 
-log = logging.getLogger(__name__)
+app = Flask(__name__)
 
-# ─── Хранилище задач (в памяти) ──────────────────────────────────────────────
+WHISPER_URL = "http://whisper-gateway:8050/transcribe"
+DIARIZE_URL = "http://diarization-gateway:8070/diarize"
+
 jobs: dict[str, dict] = {}
 jobs_lock = threading.Lock()
 
-# ─── Кэш моделей (загружаются один раз) ──────────────────────────────────────
-_whisper_model = None
-_diarization_pipeline = None
-_models_lock = threading.Lock()
+
+def log(msg: str):
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] [PIPELINE] {msg}", flush=True)
 
 
-def _get_whisper():
-    global _whisper_model
-    with _models_lock:
-        if _whisper_model is None:
-            from faster_whisper import WhisperModel
-            import torch
-            model_size = os.environ.get("WHISPER_MODEL", "large-v3-turbo")
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            compute = "float16" if device == "cuda" else "int8"
-            log.info(f"Loading Whisper {model_size} on {device}/{compute}")
-            _whisper_model = WhisperModel(model_size, device=device, compute_type=compute)
-    return _whisper_model
+def update_job(job_id: str, **kwargs):
+    with jobs_lock:
+        if job_id in jobs:
+            jobs[job_id].update(kwargs)
 
 
-def _get_diarization():
-    global _diarization_pipeline
-    with _models_lock:
-        if _diarization_pipeline is None:
-            from pyannote.audio import Pipeline as PyannotePipeline
-            import torch
-            hf_token = os.environ.get("HF_TOKEN", "")
-            if not hf_token:
-                raise RuntimeError(
-                    "HF_TOKEN не задан. Получи токен на https://huggingface.co/settings/tokens "
-                    "и прими условия использования pyannote/speaker-diarization-3.1"
-                )
-            log.info("Loading Pyannote speaker-diarization-3.1")
-            pipe = PyannotePipeline.from_pretrained(
-                "pyannote/speaker-diarization-3.1",
-                use_auth_token=hf_token,
-            )
-            if torch.cuda.is_available():
-                pipe = pipe.to(torch.device("cuda"))
-            _diarization_pipeline = pipe
-    return _diarization_pipeline
+@app.route("/pipeline/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok", "service": "pipeline-gateway"})
 
 
-# ─── Auth ─────────────────────────────────────────────────────────────────────
-_AUTH_USER = os.environ.get("SCRIBE_USER", "scribe")
-_AUTH_PASS = os.environ.get("SCRIBE_PASS", "Volyna")
-
-
-def requires_auth(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        auth = request.authorization
-        if not auth or auth.username != _AUTH_USER or auth.password != _AUTH_PASS:
-            return (
-                jsonify({"error": "Unauthorized"}),
-                401,
-                {"WWW-Authenticate": 'Basic realm="Astaro Scribe"'},
-            )
-        return f(*args, **kwargs)
-    return decorated
-
-
-# ─── Blueprint ────────────────────────────────────────────────────────────────
-pipeline_bp = Blueprint("pipeline", __name__)
-
-
-@pipeline_bp.route("/pipeline/submit", methods=["POST"])
-@requires_auth
+@app.route("/pipeline/submit", methods=["POST"])
 def submit():
     if "audio" not in request.files:
-        return jsonify({"error": "Поле 'audio' обязательно"}), 400
+        return jsonify({"error": "audio file required"}), 400
 
-    audio_file = request.files["audio"]
-    original_name = audio_file.filename or "audio"
-    suffix = os.path.splitext(original_name)[1] or ".audio"
+    audio = request.files["audio"]
+    job_id = str(uuid.uuid4())
 
+    suffix = os.path.splitext(audio.filename or "")[1] or ".audio"
     tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
-    audio_file.save(tmp.name)
+    audio.save(tmp.name)
     tmp.close()
 
-    job_id = str(uuid.uuid4())
     with jobs_lock:
         jobs[job_id] = {
             "status": "processing",
@@ -126,126 +74,110 @@ def submit():
             "error": None,
         }
 
-    t = threading.Thread(target=_process_job, args=(job_id, tmp.name), daemon=True)
+    t = threading.Thread(target=process_job, args=(job_id, tmp.name), daemon=True)
     t.start()
-
+    log(f"submit: job_id={job_id}")
     return jsonify({"job_id": job_id})
 
 
-@pipeline_bp.route("/pipeline/status/<job_id>", methods=["GET"])
-@requires_auth
+@app.route("/pipeline/status/<job_id>", methods=["GET"])
 def status(job_id):
     with jobs_lock:
         job = jobs.get(job_id)
     if job is None:
-        return jsonify({"error": "Задача не найдена"}), 404
+        return jsonify({"error": "not found"}), 404
 
-    resp: dict = {
-        "status": job["status"],
-        "step": job["step"],
-        "progress": job["progress"],
-    }
+    resp = {"status": job["status"], "step": job["step"], "progress": job["progress"]}
     if job["status"] == "done":
-        resp["segments"] = job["result"]["segments"]
-        resp["full_text"] = job["result"]["full_text"]
+        resp.update(job["result"])
     elif job["status"] == "error":
         resp["message"] = job["error"]
     return jsonify(resp)
 
 
-# ─── Фоновая обработка ────────────────────────────────────────────────────────
-def _update(job_id: str, **kwargs):
-    with jobs_lock:
-        if job_id in jobs:
-            jobs[job_id].update(kwargs)
-
-
-def _process_job(job_id: str, audio_path: str):
-    wav_path = audio_path + "_16k.wav"
-    seg_paths: list[str] = []
-
+def process_job(job_id: str, audio_path: str):
+    extra_paths: list[str] = []
     try:
-        # 1. Конвертация в 16 kHz mono WAV
-        _update(job_id, step="Конвертация аудио...", progress=0.03)
-        result = subprocess.run(
-            ["ffmpeg", "-y", "-i", audio_path,
-             "-ar", "16000", "-ac", "1", "-f", "wav", wav_path],
-            capture_output=True,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"ffmpeg: {result.stderr.decode(errors='replace')}")
+        # 1. Diarization
+        update_job(job_id, step="Диаризация (определение спикеров)...", progress=0.05)
+        log(f"[{job_id}] diarizing...")
 
-        # 2. Диаризация
-        _update(job_id, step="Диаризация (определение спикеров)...", progress=0.08)
-        diar_pipeline = _get_diarization()
-        diarization = diar_pipeline(wav_path)
+        with open(audio_path, "rb") as f:
+            r = requests.post(
+                DIARIZE_URL,
+                files={"audio": (os.path.basename(audio_path), f)},
+                timeout=14400,
+            )
 
-        raw_segments = [
-            {"speaker": speaker, "start": round(turn.start, 3), "end": round(turn.end, 3)}
-            for turn, _, speaker in diarization.itertracks(yield_label=True)
-        ]
-        log.info(f"[{job_id}] Diarization: {len(raw_segments)} segments")
+        if r.status_code != 200:
+            raise RuntimeError(f"Diarization failed {r.status_code}: {r.text[:300]}")
 
-        if not raw_segments:
+        data = r.json()
+        segments = data.get("segments", [])
+        log(f"[{job_id}] diarization: {len(segments)} segs, {data.get('num_speakers')} speakers")
+
+        if not segments:
             raise RuntimeError("Диаризация не нашла ни одного сегмента")
 
-        # 3. Транскрибация по сегментам
-        _update(job_id,
-                step=f"Транскрибация {len(raw_segments)} сегментов...",
-                progress=0.35)
+        # 2. Convert to 16 kHz WAV for slicing
+        update_job(job_id, step="Подготовка аудио для транскрибации...", progress=0.30)
+        wav_path = audio_path + "_16k.wav"
+        extra_paths.append(wav_path)
+        res = subprocess.run(
+            ["ffmpeg", "-y", "-i", audio_path, "-ar", "16000", "-ac", "1", wav_path],
+            capture_output=True,
+        )
+        if res.returncode != 0:
+            raise RuntimeError(f"ffmpeg failed: {res.stderr.decode()[:500]}")
 
-        whisper = _get_whisper()
-        lang = os.environ.get("WHISPER_LANG", "ru") or None  # None = auto
-
-        with wave.open(wav_path, "rb") as wf:
-            sample_rate = wf.getframerate()
-            n_channels = wf.getnchannels()
-            sampwidth = wf.getsampwidth()
-            raw_data = wf.readframes(wf.getnframes())
-
-        bytes_per_frame = n_channels * sampwidth
+        # 3. Transcribe each segment
         transcribed: list[dict] = []
         full_text_parts: list[str] = []
 
-        for i, seg in enumerate(raw_segments):
-            prog = 0.35 + 0.60 * (i / len(raw_segments))
-            _update(job_id,
-                    step=f"Транскрибация: {i + 1}/{len(raw_segments)}...",
-                    progress=round(prog, 3))
+        for i, seg in enumerate(segments):
+            prog = 0.35 + 0.60 * (i / len(segments))
+            update_job(job_id,
+                step=f"Транскрибация: {i+1}/{len(segments)}...",
+                progress=round(prog, 3))
 
-            start_f = int(seg["start"] * sample_rate)
-            end_f = int(seg["end"] * sample_rate)
-            chunk = raw_data[start_f * bytes_per_frame: end_f * bytes_per_frame]
-            if not chunk:
+            duration = round(seg["end"] - seg["start"], 3)
+            if duration < 0.3:
                 continue
 
-            seg_path = f"{audio_path}_s{i}.wav"
-            seg_paths.append(seg_path)
-            with wave.open(seg_path, "wb") as sw:
-                sw.setnchannels(n_channels)
-                sw.setsampwidth(sampwidth)
-                sw.setframerate(sample_rate)
-                sw.writeframes(chunk)
+            seg_path = audio_path + f"_s{i}.wav"
+            extra_paths.append(seg_path)
+
+            r2 = subprocess.run([
+                "ffmpeg", "-y", "-i", wav_path,
+                "-ss", str(seg["start"]),
+                "-t", str(duration),
+                seg_path,
+            ], capture_output=True)
+
+            if r2.returncode != 0 or not os.path.exists(seg_path):
+                continue
 
             try:
-                segs_gen, _ = whisper.transcribe(
-                    seg_path, beam_size=1, language=lang, vad_filter=True
-                )
-                text = " ".join(s.text.strip() for s in segs_gen).strip()
+                with open(seg_path, "rb") as sf:
+                    wr = requests.post(
+                        WHISPER_URL,
+                        files={"audio": ("segment.wav", sf, "audio/wav")},
+                        timeout=600,
+                    )
+                if wr.status_code == 200:
+                    text = wr.json().get("text", "").strip()
+                    if text:
+                        transcribed.append({
+                            "speaker": seg["speaker"],
+                            "start": seg["start"],
+                            "end": seg["end"],
+                            "text": text,
+                        })
+                        full_text_parts.append(text)
             except Exception as e:
-                log.warning(f"[{job_id}] seg {i} transcription failed: {e}")
-                text = ""
+                log(f"[{job_id}] seg {i} failed: {e}")
 
-            if text:
-                transcribed.append({
-                    "speaker": seg["speaker"],
-                    "start": seg["start"],
-                    "end": seg["end"],
-                    "text": text,
-                })
-                full_text_parts.append(text)
-
-        # Слияние соседних реплик одного спикера
+        # 4. Merge consecutive same-speaker segments
         merged: list[dict] = []
         for seg in transcribed:
             if merged and merged[-1]["speaker"] == seg["speaker"]:
@@ -254,22 +186,17 @@ def _process_job(job_id: str, audio_path: str):
             else:
                 merged.append(dict(seg))
 
-        _update(job_id,
-                status="done",
-                step="Готово",
-                progress=1.0,
-                result={
-                    "segments": merged,
-                    "full_text": " ".join(full_text_parts),
-                })
-        log.info(f"[{job_id}] Done — {len(merged)} merged segments")
+        update_job(job_id,
+            status="done", step="Готово", progress=1.0,
+            result={"segments": merged, "full_text": " ".join(full_text_parts)})
+        log(f"[{job_id}] done: {len(merged)} merged segments")
 
     except Exception as e:
-        log.exception(f"[{job_id}] Pipeline error")
-        _update(job_id, status="error", step="Ошибка", error=str(e))
+        log(f"[{job_id}] error: {e}")
+        update_job(job_id, status="error", step="Ошибка", error=str(e))
 
     finally:
-        for p in [audio_path, wav_path] + seg_paths:
+        for p in [audio_path] + extra_paths:
             try:
                 if os.path.exists(p):
                     os.unlink(p)
@@ -277,17 +204,5 @@ def _process_job(job_id: str, audio_path: str):
                 pass
 
 
-# ─── Standalone режим ─────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    app = Flask(__name__)
-    app.register_blueprint(pipeline_bp)
-
-    # Базовый health check
-    @app.route("/health")
-    def health():
-        return jsonify({"ok": True})
-
-    port = int(os.environ.get("PORT", 5001))
-    log.info(f"Pipeline server starting on :{port}")
-    app.run(host="0.0.0.0", port=port, threaded=True)
+    app.run(host="0.0.0.0", port=8090, threaded=True)

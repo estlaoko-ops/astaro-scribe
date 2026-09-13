@@ -15,6 +15,23 @@
 
 Приложение — тонкий клиент. Вся обработка (диаризация + транскрибация) происходит на сервере.
 
+### Серверная инфраструктура
+
+Docker-контейнеры на `n8n_default` сети:
+
+| Сервис | Порт | Что делает |
+|---|---|---|
+| `whisper-gateway` | 8050 | Прокси к `whisper:9000/asr` (Whisper Turbo) |
+| `diarization-gateway` | 8070 | Прокси к `diarization-server:8080` (Pyannote 3.1) |
+| `pipeline-gateway` | 8090 | **Новый**: оркестрирует диаризацию + транскрибацию |
+| `caddy` | 443 | Reverse proxy, Basic Auth |
+
+`pipeline-gateway` делает:
+1. `diarization-gateway:8070/diarize` → список сегментов по спикерам
+2. ffmpeg → конвертация в 16 kHz WAV
+3. Для каждого сегмента: ffmpeg slice + `whisper-gateway:8050/transcribe`
+4. Склейка соседних реплик одного спикера
+
 ---
 
 ## Сборка APK
@@ -33,8 +50,8 @@ whisper.server.url=https://turbo-whisper.attilaleo.uk
 whisper.auth=Basic c2NyaWJlOlZvbHluYQ==
 ```
 
-> Внимание: `whisper.server.url` теперь должен быть **базовым URL** без `/transcribe` на конце.
-> Приложение само добавляет пути `/pipeline/submit` и `/pipeline/status/{id}`.
+> `whisper.server.url` — **базовый URL** без пути.
+> Приложение добавляет `/pipeline/submit` и `/pipeline/status/{id}` само.
 
 ### 3. Собери APK
 ```bash
@@ -46,43 +63,37 @@ APK: `app/build/outputs/apk/debug/app-debug.apk`
 
 ---
 
-## Деплой серверного кода
-
-### Что нужно установить на сервере
+## Деплой/обновление pipeline-gateway на сервере
 
 ```bash
-pip install "pyannote.audio==3.1.*" faster-whisper
-# ffmpeg уже должен быть
+ssh root@сервер
+cd /opt/apps/local-models/pipeline-gateway
+
+# После изменения server.py — пересобрать образ:
+docker compose build --no-cache && docker compose up -d
+
+# Логи:
+docker compose logs -f
 ```
 
-### HuggingFace токен (для Pyannote)
-1. Создай аккаунт на https://huggingface.co
-2. Прими условия использования модели: https://huggingface.co/pyannote/speaker-diarization-3.1
-3. Создай токен: https://huggingface.co/settings/tokens
-4. Добавь в окружение сервера: `export HF_TOKEN=hf_...`
+### Файлы на сервере (`/opt/apps/local-models/pipeline-gateway/`)
+- `server.py` — код gateway (копия `server/pipeline_server.py` из этого репо)
+- `Dockerfile` — `python:3.11-slim` + ffmpeg + flask/requests
+- `docker-compose.yml` — сервис + подключение к `n8n_default`
 
-### Интеграция с существующим сервером
-
-Добавь в `app.py` (или как он называется):
-```python
-from pipeline_server import pipeline_bp
-app.register_blueprint(pipeline_bp)
-```
-
-Или запусти как отдельный процесс:
+### Проверка
 ```bash
-PORT=5001 HF_TOKEN=hf_... python server/pipeline_server.py
-```
+# Health check
+curl -u scribe:Volyna https://turbo-whisper.attilaleo.uk/pipeline/health
+# → {"service":"pipeline-gateway","status":"ok"}
 
-### Проверка (curl)
-```bash
 # Загрузить файл
 curl -u scribe:Volyna \
      -F "audio=@test.mp3" \
      https://turbo-whisper.attilaleo.uk/pipeline/submit
 # → {"job_id": "abc-123"}
 
-# Проверить статус
+# Статус
 curl -u scribe:Volyna \
      https://turbo-whisper.attilaleo.uk/pipeline/status/abc-123
 # → {"status": "done", "segments": [...], "full_text": "..."}
@@ -117,7 +128,7 @@ app/src/main/java/com/diarizer/sherpa/
 └── FileLogger.kt         — Логирование
 
 server/
-└── pipeline_server.py    — Flask blueprint: /pipeline/submit + /pipeline/status
+└── pipeline_server.py    — Код pipeline-gateway (деплоится на сервер)
 ```
 
 ## Credentials (не коммитить!)

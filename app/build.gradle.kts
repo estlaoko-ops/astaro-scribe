@@ -17,8 +17,8 @@ android {
         applicationId = "com.diarizer.sherpa"
         minSdk = 26
         targetSdk = 34
-        versionCode = 13
-        versionName = "6.9-phoenicia"
+        versionCode = 14
+        versionName = "7.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
