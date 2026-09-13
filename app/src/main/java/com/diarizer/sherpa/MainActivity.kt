@@ -4,6 +4,8 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.ContentValues
 import android.content.Intent
+import android.content.SharedPreferences
+import android.media.MediaPlayer
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -16,6 +18,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -27,6 +30,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -34,10 +38,18 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.UUID
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
 
 // ─── Colors ───────────────────────────────────────────────────────────────────
 
@@ -50,6 +62,12 @@ private val OnSurfaceVar = Color(0xFF94A3B8)
 private val AccentIndigo = Color(0xFF4F46E5)
 private val AccentGreen  = Color(0xFF34D399)
 private val ErrorRed     = Color(0xFFF87171)
+
+private val SpeakerPalette = listOf(
+    Color(0xFF818CF8), Color(0xFFA78BFA), Color(0xFF34D399),
+    Color(0xFFFBBF24), Color(0xFF60A5FA), Color(0xFFFB923C),
+    Color(0xFFF472B6), Color(0xFF4ADE80),
+)
 
 private val AppColorScheme = darkColorScheme(
     primary          = Primary,
@@ -73,6 +91,51 @@ private fun fmtDuration(sec: Long): String {
     return if (m > 0) "%d:%02d".format(m, s) else "${s}с"
 }
 
+private fun fmtDate(ms: Long): String =
+    SimpleDateFormat("d MMM, HH:mm", Locale("ru")).format(Date(ms))
+
+private fun buildSpeakerText(
+    segments: List<ServerApi.Segment>,
+    names: Map<String, String>,
+): String {
+    val sb = StringBuilder()
+    var last: String? = null
+    for (seg in segments) {
+        val name = names[seg.speaker] ?: seg.speaker
+        if (name != last) {
+            if (sb.isNotEmpty()) sb.append("\n\n")
+            sb.append("$name:\n")
+            last = name
+        }
+        sb.append(seg.text.trim()).append(" ")
+    }
+    return sb.toString().trimEnd()
+}
+
+private fun speakerColor(rawId: String, allSpeakers: List<String>): Color {
+    val idx = allSpeakers.indexOf(rawId).coerceAtLeast(0)
+    return SpeakerPalette[idx % SpeakerPalette.size]
+}
+
+private fun saveStepLog(prefs: SharedPreferences, log: List<StepEntry>) {
+    val arr = JSONArray()
+    log.forEach { arr.put(JSONObject().put("label", it.label).put("elapsed", it.elapsedSec)) }
+    prefs.edit().putString("step_log", arr.toString()).apply()
+}
+
+private fun loadStepLog(prefs: SharedPreferences): List<StepEntry> {
+    val json = prefs.getString("step_log", null) ?: return emptyList()
+    return try {
+        val arr = JSONArray(json)
+        (0 until arr.length()).map { i ->
+            val o = arr.getJSONObject(i)
+            StepEntry(o.getString("label"), o.getLong("elapsed"))
+        }
+    } catch (_: Exception) { emptyList() }
+}
+
+// ─── Data classes ─────────────────────────────────────────────────────────────
+
 private data class StepEntry(val label: String, val elapsedSec: Long)
 
 // ─── UI State ─────────────────────────────────────────────────────────────────
@@ -85,7 +148,6 @@ private sealed class UiState {
     data class Done(
         val segments: List<ServerApi.Segment>,
         val fullText: String,
-        val speakerText: String,
     ) : UiState()
     data class Error(val message: String) : UiState()
 }
@@ -110,7 +172,6 @@ private fun MainScreen() {
     val context = LocalContext.current
     val activity = context as MainActivity
     val scope = rememberCoroutineScope()
-
     val prefs = remember { context.getSharedPreferences("astaro_prefs", android.content.Context.MODE_PRIVATE) }
 
     var uiState by remember { mutableStateOf<UiState>(UiState.Idle) }
@@ -122,12 +183,22 @@ private fun MainScreen() {
     var stepLog by remember { mutableStateOf(listOf<StepEntry>()) }
     var lastLoggedStep by remember { mutableStateOf("") }
     var activeUploadJob by remember { mutableStateOf<Job?>(null) }
+    var speakerNames by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
 
-    // ── Restore saved job on app start ────────────────────────────────────
+    // ── Permission: POST_NOTIFICATIONS (Android 13+) ───────────────────────
+    val notifPermLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { /* granted or not — we tried */ }
+
+    // ── Restore saved job on app start ─────────────────────────────────────
     LaunchedEffect(Unit) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            notifPermLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+        }
         val savedId = prefs.getString("job_id", null) ?: return@LaunchedEffect
         selectedName = prefs.getString("file_name", "") ?: ""
         startMs = prefs.getLong("start_ms", System.currentTimeMillis())
+        stepLog = loadStepLog(prefs)
         uiState = UiState.Processing("Восстановление соединения...", 0f)
         jobId = savedId
         activity.startForegroundService(
@@ -154,39 +225,44 @@ private fun MainScreen() {
                 val s = ServerApi.pollStatus(id)
                 when (s.status) {
                     "done" -> {
-                        prefs.edit().remove("job_id").remove("start_ms").remove("file_name").apply()
+                        prefs.edit().remove("job_id").remove("start_ms").remove("file_name").remove("step_log").apply()
                         activity.stopService(Intent(activity, TranscriberService::class.java))
                         val segs = s.segments ?: emptyList()
-                        uiState = UiState.Done(segs, s.fullText ?: "", ServerApi.formatSpeakerText(segs))
+                        val rawSpeakers = segs.map { it.speaker }.distinct().sorted()
+                        speakerNames = rawSpeakers.mapIndexed { i, id2 -> id2 to "Спикер ${i + 1}" }.toMap()
+                        val initialSpeakerText = buildSpeakerText(segs, speakerNames)
+                        HistoryManager.add(prefs, HistoryEntry(
+                            id = UUID.randomUUID().toString(),
+                            timestamp = System.currentTimeMillis(),
+                            fileName = selectedName,
+                            speakerText = initialSpeakerText,
+                            fullText = s.fullText ?: "",
+                        ))
+                        uiState = UiState.Done(segs, s.fullText ?: "")
                         jobId = null
                         break
                     }
                     "error" -> {
-                        prefs.edit().remove("job_id").remove("start_ms").remove("file_name").apply()
+                        prefs.edit().remove("job_id").remove("start_ms").remove("file_name").remove("step_log").apply()
                         activity.stopService(Intent(activity, TranscriberService::class.java))
                         uiState = UiState.Error(s.errorMessage ?: "Ошибка на сервере")
-                        jobId = null
-                        break
+                        jobId = null; break
                     }
                     "not_found", "cancelled" -> {
-                        prefs.edit().remove("job_id").remove("start_ms").remove("file_name").apply()
+                        prefs.edit().remove("job_id").remove("start_ms").remove("file_name").remove("step_log").apply()
                         activity.stopService(Intent(activity, TranscriberService::class.java))
                         uiState = UiState.Error(s.errorMessage ?: "Задача не найдена или отменена")
-                        jobId = null
-                        break
+                        jobId = null; break
                     }
                     else -> {
                         if (s.step != lastLoggedStep) {
                             lastLoggedStep = s.step
                             val elapsed = if (startMs > 0L) (System.currentTimeMillis() - startMs) / 1000 else 0L
                             stepLog = stepLog + StepEntry(s.step, elapsed)
+                            saveStepLog(prefs, stepLog)
                         }
                         uiState = UiState.Processing(s.step, s.progress)
-                        TranscriberService.postProgress(
-                            context, s.step,
-                            (s.progress * 100).toInt(),
-                            s.progress < 0.05f,
-                        )
+                        TranscriberService.postProgress(context, s.step, (s.progress * 100).toInt(), s.progress < 0.05f)
                     }
                 }
             } catch (_: Exception) { /* keep polling on transient errors */ }
@@ -204,7 +280,7 @@ private fun MainScreen() {
         }
     }
 
-    // ── Cancel current job ─────────────────────────────────────────────────
+    // ── Cancel ─────────────────────────────────────────────────────────────
     fun cancelCurrentJob() {
         activeUploadJob?.cancel(); activeUploadJob = null
         val id = jobId
@@ -212,7 +288,7 @@ private fun MainScreen() {
             scope.launch { runCatching { ServerApi.cancelJob(id) } }
             jobId = null
         }
-        prefs.edit().remove("job_id").remove("start_ms").remove("file_name").apply()
+        prefs.edit().remove("job_id").remove("start_ms").remove("file_name").remove("step_log").apply()
         activity.stopService(Intent(activity, TranscriberService::class.java))
         startMs = 0L; stepLog = emptyList(); lastLoggedStep = ""
         uiState = if (selectedUri != null) {
@@ -222,29 +298,22 @@ private fun MainScreen() {
         } else UiState.Idle
     }
 
-    // ── Upload action ──────────────────────────────────────────────────────
+    // ── Upload ─────────────────────────────────────────────────────────────
     fun startUpload() {
         val uri = selectedUri ?: return
         startMs = System.currentTimeMillis()
-        stepLog = emptyList()
-        lastLoggedStep = ""
+        stepLog = emptyList(); lastLoggedStep = ""
         uiState = UiState.Uploading
-
         activity.startForegroundService(
             Intent(activity, TranscriberService::class.java)
                 .putExtra("status_text", "Загрузка на сервер...")
         )
-
         activeUploadJob = scope.launch {
             try {
                 val id = ServerApi.submitJob(context, uri)
                 if (!isActive) return@launch
                 activeUploadJob = null
-                prefs.edit()
-                    .putString("job_id", id)
-                    .putLong("start_ms", startMs)
-                    .putString("file_name", selectedName)
-                    .apply()
+                prefs.edit().putString("job_id", id).putLong("start_ms", startMs).putString("file_name", selectedName).apply()
                 jobId = id
                 uiState = UiState.Processing("Задача принята, обрабатывается...", 0f)
             } catch (e: Exception) {
@@ -255,41 +324,43 @@ private fun MainScreen() {
         }
     }
 
-    // ── Version history ────────────────────────────────────────────────────
+    // ── Dialogs ────────────────────────────────────────────────────────────
     var showVersionHistory by remember { mutableStateOf(false) }
+    var showHistoryDialog by remember { mutableStateOf(false) }
+
     val versionHistory = listOf(
-        "v7.0 — Server-side pipeline, thin client",
+        "v7.0 · Sumer · Server-side pipeline",
         "v6.9 · Phoenicia · Whisper Small INT8",
         "v6.8 · Hittite · Whisper Small INT8",
         "v6.7 · Assyria · Whisper Small INT8",
         "v6.6 · Babylon · Whisper Small INT8",
         "v6.5 · Persia · Whisper Small INT8",
     )
+
     if (showVersionHistory) {
         AlertDialog(
             onDismissRequest = { showVersionHistory = false },
             title = { Text("История версий") },
             text = {
-                Column {
+                Column(Modifier.verticalScroll(rememberScrollState())) {
                     versionHistory.forEach { entry ->
-                        Text(
-                            entry,
-                            style = TextStyle(fontSize = 13.sp, color = OnSurface,
-                                fontFamily = FontFamily.Monospace),
-                            modifier = Modifier.padding(vertical = 3.dp),
-                        )
+                        Text(entry,
+                            style = TextStyle(fontSize = 13.sp, color = OnSurface, fontFamily = FontFamily.Monospace),
+                            modifier = Modifier.padding(vertical = 3.dp))
                     }
                 }
             },
-            confirmButton = {
-                TextButton(onClick = { showVersionHistory = false }) { Text("Закрыть") }
-            },
+            confirmButton = { TextButton(onClick = { showVersionHistory = false }) { Text("Закрыть") } },
             containerColor = Surface,
         )
     }
 
+    if (showHistoryDialog) {
+        HistoryDialog(prefs = prefs) { showHistoryDialog = false }
+    }
+
     // ── Layout ─────────────────────────────────────────────────────────────
-    Surface(modifier = Modifier.fillMaxSize(), color = Background) {
+    androidx.compose.material3.Surface(modifier = Modifier.fillMaxSize(), color = Background) {
         Column(
             modifier = Modifier
                 .fillMaxSize()
@@ -298,16 +369,19 @@ private fun MainScreen() {
         ) {
             Spacer(Modifier.height(56.dp))
 
-            Text(
-                "Astaro Scribe",
-                style = TextStyle(fontSize = 22.sp, fontWeight = FontWeight.Bold,
-                    color = Primary, letterSpacing = 0.3.sp),
-            )
-            Text(
-                "v7.0",
-                style = TextStyle(fontSize = 12.sp, color = OnSurfaceVar),
-                modifier = Modifier.clickable { showVersionHistory = true },
-            )
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Bottom) {
+                Column(Modifier.weight(1f)) {
+                    Text("Astaro Scribe",
+                        style = TextStyle(fontSize = 22.sp, fontWeight = FontWeight.Bold,
+                            color = Primary, letterSpacing = 0.3.sp))
+                    Text("v7.0 · Sumer",
+                        style = TextStyle(fontSize = 12.sp, color = OnSurfaceVar),
+                        modifier = Modifier.clickable { showVersionHistory = true })
+                }
+                TextButton(onClick = { showHistoryDialog = true }) {
+                    Text("История", fontSize = 13.sp, color = OnSurfaceVar)
+                }
+            }
             Spacer(Modifier.height(28.dp))
 
             when (val s = uiState) {
@@ -338,16 +412,25 @@ private fun MainScreen() {
                     CancelButton { cancelCurrentJob() }
                 }
 
-                is UiState.Done ->
-                    ResultBlock(s) {
-                        selectedUri = null
-                        selectedName = ""
-                        jobId = null
-                        startMs = 0L
-                        stepLog = emptyList()
-                        prefs.edit().remove("job_id").remove("start_ms").remove("file_name").apply()
-                        uiState = UiState.Idle
+                is UiState.Done -> {
+                    val speakerText = remember(s.segments, speakerNames) {
+                        buildSpeakerText(s.segments, speakerNames)
                     }
+                    ResultBlock(
+                        state = s,
+                        speakerText = speakerText,
+                        speakerNames = speakerNames,
+                        audioUri = selectedUri,
+                        onRenameConfirm = { speakerNames = it },
+                        onReset = {
+                            selectedUri = null; selectedName = ""
+                            jobId = null; startMs = 0L; stepLog = emptyList()
+                            prefs.edit().remove("job_id").remove("start_ms").remove("file_name").remove("step_log").apply()
+                            speakerNames = emptyMap()
+                            uiState = UiState.Idle
+                        },
+                    )
+                }
 
                 is UiState.Error ->
                     ErrorCard(s.message) {
@@ -364,7 +447,393 @@ private fun MainScreen() {
     }
 }
 
-// ─── Cards ────────────────────────────────────────────────────────────────────
+// ─── Player ───────────────────────────────────────────────────────────────────
+
+@Composable
+private fun PlayerCard(
+    uri: Uri?,
+    segments: List<ServerApi.Segment>,
+    speakerNames: Map<String, String>,
+    currentSegIdx: Int,
+    onCurrentSegChange: (Int) -> Unit,
+) {
+    if (uri == null) return
+
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+
+    var mediaPlayer by remember { mutableStateOf<MediaPlayer?>(null) }
+    var isPlaying by remember { mutableStateOf(false) }
+    var playerPos by remember { mutableStateOf(0L) }
+    var playerDuration by remember { mutableStateOf(0L) }
+
+    // Init MediaPlayer
+    DisposableEffect(uri) {
+        val mp = MediaPlayer()
+        val job = scope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    mp.setDataSource(context, uri)
+                    mp.prepare()
+                }
+                playerDuration = mp.duration.toLong()
+                mp.setOnCompletionListener {
+                    isPlaying = false
+                    playerPos = 0L
+                    onCurrentSegChange(-1)
+                }
+                mediaPlayer = mp
+            } catch (_: Exception) { mp.release() }
+        }
+        onDispose {
+            job.cancel()
+            runCatching { if (mp.isPlaying) mp.stop() }
+            mp.release()
+            mediaPlayer = null
+            isPlaying = false
+            playerPos = 0L
+        }
+    }
+
+    // Position tracker
+    LaunchedEffect(isPlaying, mediaPlayer) {
+        val mp = mediaPlayer ?: return@LaunchedEffect
+        if (!isPlaying) return@LaunchedEffect
+        while (isActive) {
+            val pos = mp.currentPosition.toLong()
+            playerPos = pos
+            val idx = segments.indexOfFirst { pos >= (it.start * 1000).toLong() && pos <= (it.end * 1000).toLong() }
+            if (idx != currentSegIdx) onCurrentSegChange(idx)
+            delay(150)
+        }
+    }
+
+    val mp = mediaPlayer
+    if (mp != null && playerDuration > 0L) {
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = Surface),
+            shape = RoundedCornerShape(14.dp),
+            border = BorderStroke(1.dp, SurfaceVar),
+        ) {
+            Column(Modifier.padding(horizontal = 16.dp, vertical = 10.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    val segIdx = if (currentSegIdx >= 0 && currentSegIdx < segments.size) currentSegIdx else -1
+                    val speakerColor = if (segIdx >= 0) {
+                        val allSpeakers = segments.map { it.speaker }.distinct().sorted()
+                        speakerColor(segments[segIdx].speaker, allSpeakers)
+                    } else OnSurfaceVar
+
+                    TextButton(
+                        onClick = {
+                            if (isPlaying) { mp.pause(); isPlaying = false }
+                            else { mp.start(); isPlaying = true }
+                        },
+                        modifier = Modifier.size(44.dp),
+                        contentPadding = PaddingValues(0.dp),
+                    ) {
+                        Text(if (isPlaying) "⏸" else "▶", fontSize = 20.sp, color = speakerColor)
+                    }
+
+                    Column(Modifier.weight(1f)) {
+                        Slider(
+                            value = playerPos.toFloat() / playerDuration.toFloat(),
+                            onValueChange = { v ->
+                                val seekTo = (v * playerDuration).toLong()
+                                mp.seekTo(seekTo.toInt())
+                                playerPos = seekTo
+                            },
+                            colors = SliderDefaults.colors(
+                                thumbColor = Primary,
+                                activeTrackColor = Primary,
+                                inactiveTrackColor = SurfaceVar,
+                            ),
+                        )
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Text(fmtDuration(playerPos / 1000), fontSize = 10.sp, color = OnSurfaceVar)
+                            if (segIdx >= 0) {
+                                val name = speakerNames[segments[segIdx].speaker] ?: segments[segIdx].speaker
+                                Text(name, fontSize = 10.sp, color = speakerColor)
+                            }
+                            Text(fmtDuration(playerDuration / 1000), fontSize = 10.sp, color = OnSurfaceVar)
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = Surface),
+            shape = RoundedCornerShape(14.dp),
+            border = BorderStroke(1.dp, SurfaceVar),
+        ) {
+            Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                CircularProgressIndicator(Modifier.size(14.dp), color = OnSurfaceVar, strokeWidth = 2.dp)
+                Spacer(Modifier.width(10.dp))
+                Text("Загрузка плеера...", fontSize = 13.sp, color = OnSurfaceVar)
+            }
+        }
+    }
+}
+
+// ─── Result ───────────────────────────────────────────────────────────────────
+
+@Composable
+private fun ResultBlock(
+    state: UiState.Done,
+    speakerText: String,
+    speakerNames: Map<String, String>,
+    audioUri: Uri?,
+    onRenameConfirm: (Map<String, String>) -> Unit,
+    onReset: () -> Unit,
+) {
+    val context = LocalContext.current
+    var expandSpeaker by remember { mutableStateOf(false) }
+    var expandPlain by remember { mutableStateOf(false) }
+    var showRenameDialog by remember { mutableStateOf(false) }
+    var currentSegIdx by remember { mutableStateOf(-1) }
+
+    if (showRenameDialog) {
+        SpeakerRenameDialog(
+            speakerNames = speakerNames,
+            onSave = { onRenameConfirm(it); showRenameDialog = false },
+            onDismiss = { showRenameDialog = false },
+        )
+    }
+
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text("✓", fontWeight = FontWeight.Bold, color = AccentGreen, fontSize = 16.sp)
+        Spacer(Modifier.width(6.dp))
+        Text("Готово", fontWeight = FontWeight.SemiBold, color = AccentGreen, fontSize = 15.sp)
+        Spacer(Modifier.weight(1f))
+        TextButton(onClick = onReset) { Text("↩ Новый файл", color = OnSurfaceVar, fontSize = 13.sp) }
+    }
+    Spacer(Modifier.height(10.dp))
+
+    // ── Audio player ───────────────────────────────────────────────────────
+    if (audioUri != null) {
+        PlayerCard(
+            uri = audioUri,
+            segments = state.segments,
+            speakerNames = speakerNames,
+            currentSegIdx = currentSegIdx,
+            onCurrentSegChange = { currentSegIdx = it },
+        )
+        Spacer(Modifier.height(8.dp))
+    }
+
+    // ── По спикерам ────────────────────────────────────────────────────────
+    val allSpeakers = remember(state.segments) { state.segments.map { it.speaker }.distinct().sorted() }
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = Surface),
+        shape = RoundedCornerShape(14.dp),
+        border = BorderStroke(1.dp, SurfaceVar),
+    ) {
+        Column {
+            Row(
+                Modifier.fillMaxWidth().clickable { expandSpeaker = !expandSpeaker }
+                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("По спикерам", fontSize = 14.sp, color = OnSurface, modifier = Modifier.weight(1f))
+                if (speakerNames.isNotEmpty()) {
+                    TextButton(
+                        onClick = { showRenameDialog = true },
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                    ) { Text("✏ Переименовать", fontSize = 11.sp, color = Primary) }
+                }
+                Text(if (expandSpeaker) "▲" else "▼", fontSize = 11.sp, color = OnSurfaceVar)
+            }
+            AnimatedVisibility(visible = expandSpeaker) {
+                Column {
+                    Divider(color = SurfaceVar, thickness = 1.dp)
+                    // Segment list with highlighting
+                    val segsScrollState = rememberScrollState()
+                    val density = LocalDensity.current
+                    LaunchedEffect(currentSegIdx) {
+                        if (currentSegIdx > 1) {
+                            val px = with(density) { ((currentSegIdx - 1) * 68).dp.roundToPx() }
+                            segsScrollState.animateScrollTo(px)
+                        }
+                    }
+                    Column(
+                        modifier = Modifier
+                            .heightIn(max = 420.dp)
+                            .verticalScroll(segsScrollState),
+                    ) {
+                        state.segments.forEachIndexed { i, seg ->
+                            val color = speakerColor(seg.speaker, allSpeakers)
+                            val name = speakerNames[seg.speaker] ?: seg.speaker
+                            val isActive = i == currentSegIdx
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .background(if (isActive) color.copy(alpha = 0.10f) else Color.Transparent)
+                                    .clickable { /* tap to seek handled via player */ }
+                                    .padding(horizontal = 12.dp, vertical = 5.dp),
+                                verticalAlignment = Alignment.Top,
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .width(3.dp)
+                                        .height(with(density) { 48.dp })
+                                        .background(if (isActive) color else color.copy(alpha = 0.35f),
+                                            RoundedCornerShape(2.dp))
+                                )
+                                Spacer(Modifier.width(10.dp))
+                                Column(Modifier.weight(1f)) {
+                                    Text(name, fontSize = 11.sp, color = color, fontWeight = FontWeight.SemiBold)
+                                    Text(seg.text, fontSize = 12.sp, color = OnSurface, lineHeight = 17.sp)
+                                }
+                                Text(fmtDuration(seg.start.toLong()), fontSize = 10.sp, color = OnSurfaceVar,
+                                    modifier = Modifier.padding(start = 8.dp, top = 2.dp))
+                            }
+                        }
+                    }
+                    Divider(color = SurfaceVar, thickness = 1.dp)
+                    Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
+                        horizontalArrangement = Arrangement.End) {
+                        TextButton(onClick = { copyText(context, speakerText) }) {
+                            Text("Копировать", color = Primary, fontSize = 13.sp)
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Spacer(Modifier.height(8.dp))
+
+    // ── Скачать ────────────────────────────────────────────────────────────
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = Surface),
+        shape = RoundedCornerShape(14.dp),
+        border = BorderStroke(1.dp, SurfaceVar),
+    ) {
+        Row(Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically) {
+            Text("Скачать файл", fontSize = 14.sp, color = OnSurface, modifier = Modifier.weight(1f))
+            TextButton(onClick = { saveToDownloads(context, speakerText) }) {
+                Text("⬇ .txt", color = Primary, fontSize = 13.sp)
+            }
+        }
+    }
+    Spacer(Modifier.height(8.dp))
+
+    // ── Сплошной текст ─────────────────────────────────────────────────────
+    ResultPanel("Сплошной текст", expandPlain, { expandPlain = !expandPlain }, state.fullText) {
+        copyText(context, state.fullText)
+    }
+}
+
+// ─── Speaker Rename Dialog ────────────────────────────────────────────────────
+
+@Composable
+private fun SpeakerRenameDialog(
+    speakerNames: Map<String, String>,
+    onSave: (Map<String, String>) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var edits by remember { mutableStateOf(speakerNames.toMap()) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Переименовать спикеров") },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState())) {
+                speakerNames.keys.sorted().forEach { rawId ->
+                    OutlinedTextField(
+                        value = edits[rawId] ?: "",
+                        onValueChange = { v -> edits = edits.toMutableMap().also { it[rawId] = v } },
+                        label = { Text(rawId, fontSize = 11.sp) },
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                        singleLine = true,
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = Primary,
+                            unfocusedBorderColor = SurfaceVar,
+                            focusedTextColor = OnSurface,
+                            unfocusedTextColor = OnSurface,
+                        ),
+                    )
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = { onSave(edits) }) { Text("Сохранить") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Отмена") } },
+        containerColor = Surface,
+    )
+}
+
+// ─── History Dialog ───────────────────────────────────────────────────────────
+
+@Composable
+private fun HistoryDialog(prefs: SharedPreferences, onDismiss: () -> Unit) {
+    var entries by remember { mutableStateOf(HistoryManager.load(prefs)) }
+    var viewEntry by remember { mutableStateOf<HistoryEntry?>(null) }
+
+    if (viewEntry != null) {
+        val e = viewEntry!!
+        AlertDialog(
+            onDismissRequest = { viewEntry = null },
+            title = { Text(e.fileName, maxLines = 2, overflow = TextOverflow.Ellipsis) },
+            text = {
+                Column(Modifier.verticalScroll(rememberScrollState())) {
+                    Text(fmtDate(e.timestamp), fontSize = 11.sp, color = OnSurfaceVar)
+                    Spacer(Modifier.height(8.dp))
+                    Text(e.speakerText, fontSize = 12.sp, color = OnSurface,
+                        fontFamily = FontFamily.Monospace, lineHeight = 18.sp)
+                }
+            },
+            confirmButton = {
+                val ctx = LocalContext.current
+                TextButton(onClick = { copyText(ctx, e.speakerText); viewEntry = null }) { Text("Копировать") }
+            },
+            dismissButton = { TextButton(onClick = { viewEntry = null }) { Text("Закрыть") } },
+            containerColor = Surface,
+        )
+        return
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("История транскрибаций") },
+        text = {
+            if (entries.isEmpty()) {
+                Text("Нет сохранённых транскрибаций", fontSize = 13.sp, color = OnSurfaceVar)
+            } else {
+                Column(Modifier.verticalScroll(rememberScrollState())) {
+                    entries.forEach { e ->
+                        Card(
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp).clickable { viewEntry = e },
+                            colors = CardDefaults.cardColors(containerColor = SurfaceVar),
+                            shape = RoundedCornerShape(10.dp),
+                        ) {
+                            Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                                Column(Modifier.weight(1f)) {
+                                    Text(e.fileName, fontSize = 13.sp, color = OnSurface,
+                                        maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Medium)
+                                    Text(fmtDate(e.timestamp), fontSize = 11.sp, color = OnSurfaceVar)
+                                    Text(e.speakerText.take(80) + if (e.speakerText.length > 80) "…" else "",
+                                        fontSize = 11.sp, color = OnSurfaceVar, maxLines = 2)
+                                }
+                                TextButton(
+                                    onClick = { HistoryManager.delete(prefs, e.id); entries = HistoryManager.load(prefs) },
+                                    contentPadding = PaddingValues(4.dp),
+                                ) { Text("✕", color = ErrorRed, fontSize = 14.sp) }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Закрыть") } },
+        containerColor = Surface,
+    )
+}
+
+// ─── Common composables ───────────────────────────────────────────────────────
 
 @Composable
 private fun PickerCard(onClick: () -> Unit) {
@@ -374,8 +843,7 @@ private fun PickerCard(onClick: () -> Unit) {
         shape = RoundedCornerShape(16.dp),
         border = BorderStroke(1.5.dp, SurfaceVar),
     ) {
-        Column(Modifier.fillMaxSize(),
-            horizontalAlignment = Alignment.CenterHorizontally,
+        Column(Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center) {
             Text("+", fontSize = 32.sp, color = OnSurfaceVar)
             Spacer(Modifier.height(6.dp))
@@ -386,12 +854,7 @@ private fun PickerCard(onClick: () -> Unit) {
 }
 
 @Composable
-private fun FileCard(
-    name: String,
-    sizeMb: Float,
-    compact: Boolean = false,
-    onChangeTap: (() -> Unit)?,
-) {
+private fun FileCard(name: String, sizeMb: Float, compact: Boolean = false, onChangeTap: (() -> Unit)?) {
     Card(
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = Surface),
@@ -405,13 +868,10 @@ private fun FileCard(
             Column(Modifier.weight(1f)) {
                 Text(name, fontSize = 13.sp, color = OnSurface, fontWeight = FontWeight.Medium,
                     maxLines = 1, overflow = TextOverflow.Ellipsis)
-                if (sizeMb > 0)
-                    Text("%.1f МБ".format(sizeMb), fontSize = 11.sp, color = OnSurfaceVar)
+                if (sizeMb > 0) Text("%.1f МБ".format(sizeMb), fontSize = 11.sp, color = OnSurfaceVar)
             }
             if (onChangeTap != null) {
-                TextButton(onClick = onChangeTap) {
-                    Text("↩", fontSize = 16.sp, color = OnSurfaceVar)
-                }
+                TextButton(onClick = onChangeTap) { Text("↩", fontSize = 16.sp, color = OnSurfaceVar) }
             }
         }
     }
@@ -422,7 +882,6 @@ private fun ProgressCard(step: String, progress: Float, elapsed: Long, indetermi
     val timeStr = if (elapsed > 0) "  ⏱ ${fmtDuration(elapsed)}" else ""
     val etaSec = if (progress > 0.05f && elapsed > 5L)
         (elapsed * (1.0 - progress) / progress).toLong() else -1L
-
     Card(
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = Surface),
@@ -438,11 +897,9 @@ private fun ProgressCard(step: String, progress: Float, elapsed: Long, indetermi
             }
             if (!indeterminate && progress > 0.01f) {
                 Spacer(Modifier.height(12.dp))
-                LinearProgressIndicator(
-                    progress = progress.coerceIn(0f, 1f),
+                LinearProgressIndicator(progress = progress.coerceIn(0f, 1f),
                     modifier = Modifier.fillMaxWidth().height(4.dp),
-                    color = Primary, trackColor = SurfaceVar,
-                )
+                    color = Primary, trackColor = SurfaceVar)
                 Spacer(Modifier.height(4.dp))
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                     Text("${(progress * 100).toInt()}%", fontSize = 11.sp, color = OnSurfaceVar)
@@ -465,36 +922,22 @@ private fun StepLogCard(log: List<StepEntry>) {
     ) {
         Column {
             Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clickable { expanded = !expanded }
+                modifier = Modifier.fillMaxWidth().clickable { expanded = !expanded }
                     .padding(horizontal = 16.dp, vertical = 10.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Text("Детали обработки", fontSize = 12.sp, color = OnSurfaceVar,
-                    modifier = Modifier.weight(1f))
+                Text("Детали обработки", fontSize = 12.sp, color = OnSurfaceVar, modifier = Modifier.weight(1f))
                 Text(if (expanded) "▲" else "▼", fontSize = 10.sp, color = OnSurfaceVar)
             }
             AnimatedVisibility(visible = expanded) {
                 Column(Modifier.padding(start = 16.dp, end = 16.dp, bottom = 12.dp)) {
                     log.forEachIndexed { i, entry ->
-                        val duration = if (i + 1 < log.size) log[i + 1].elapsedSec - entry.elapsedSec
-                                       else null
-                        Row(
-                            modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp),
-                            verticalAlignment = Alignment.Top,
-                        ) {
-                            Text(
-                                fmtDuration(entry.elapsedSec),
-                                fontSize = 11.sp, color = Primary,
-                                fontFamily = FontFamily.Monospace,
-                                modifier = Modifier.width(48.dp),
-                            )
-                            Text(
-                                entry.label + if (duration != null) "  (+${fmtDuration(duration)})" else "",
-                                fontSize = 11.sp, color = OnSurface,
-                                modifier = Modifier.weight(1f),
-                            )
+                        val duration = if (i + 1 < log.size) log[i + 1].elapsedSec - entry.elapsedSec else null
+                        Row(Modifier.fillMaxWidth().padding(vertical = 3.dp), verticalAlignment = Alignment.Top) {
+                            Text(fmtDuration(entry.elapsedSec), fontSize = 11.sp, color = Primary,
+                                fontFamily = FontFamily.Monospace, modifier = Modifier.width(48.dp))
+                            Text(entry.label + if (duration != null) "  (+${fmtDuration(duration)})" else "",
+                                fontSize = 11.sp, color = OnSurface, modifier = Modifier.weight(1f))
                         }
                     }
                 }
@@ -505,12 +948,9 @@ private fun StepLogCard(log: List<StepEntry>) {
 
 @Composable
 private fun ActionButton(label: String, onClick: () -> Unit) {
-    Button(
-        onClick = onClick,
-        modifier = Modifier.fillMaxWidth().height(56.dp),
+    Button(onClick = onClick, modifier = Modifier.fillMaxWidth().height(56.dp),
         colors = ButtonDefaults.buttonColors(containerColor = AccentIndigo),
-        shape = RoundedCornerShape(14.dp),
-    ) {
+        shape = RoundedCornerShape(14.dp)) {
         Text(label, fontWeight = FontWeight.SemiBold, fontSize = 15.sp, color = Color.White)
     }
 }
@@ -518,24 +958,19 @@ private fun ActionButton(label: String, onClick: () -> Unit) {
 @Composable
 private fun CancelButton(onClick: () -> Unit) {
     OutlinedButton(
-        onClick = onClick,
-        modifier = Modifier.fillMaxWidth(),
+        onClick = onClick, modifier = Modifier.fillMaxWidth(),
         colors = ButtonDefaults.outlinedButtonColors(contentColor = ErrorRed),
         border = BorderStroke(1.dp, ErrorRed.copy(alpha = 0.4f)),
         shape = RoundedCornerShape(14.dp),
-    ) {
-        Text("Остановить обработку", fontSize = 14.sp)
-    }
+    ) { Text("Остановить обработку", fontSize = 14.sp) }
 }
 
 @Composable
 private fun ErrorCard(message: String, onRetry: () -> Unit) {
-    Card(
-        modifier = Modifier.fillMaxWidth(),
+    Card(modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = Color(0xFF1A0A0A)),
         shape = RoundedCornerShape(14.dp),
-        border = BorderStroke(1.dp, ErrorRed.copy(alpha = 0.5f)),
-    ) {
+        border = BorderStroke(1.dp, ErrorRed.copy(alpha = 0.5f))) {
         Column(Modifier.padding(16.dp)) {
             Text("Ошибка", fontWeight = FontWeight.SemiBold, color = ErrorRed, fontSize = 14.sp)
             Spacer(Modifier.height(6.dp))
@@ -546,89 +981,29 @@ private fun ErrorCard(message: String, onRetry: () -> Unit) {
     }
 }
 
-// ─── Result ───────────────────────────────────────────────────────────────────
-
 @Composable
-private fun ResultBlock(state: UiState.Done, onReset: () -> Unit) {
-    val context = LocalContext.current
-    var expandSpeaker by remember { mutableStateOf(false) }
-    var expandPlain by remember { mutableStateOf(false) }
-
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Text("✓", fontWeight = FontWeight.Bold, color = AccentGreen, fontSize = 16.sp)
-        Spacer(Modifier.width(6.dp))
-        Text("Готово", fontWeight = FontWeight.SemiBold, color = AccentGreen, fontSize = 15.sp)
-        Spacer(Modifier.weight(1f))
-        TextButton(onClick = onReset) {
-            Text("↩ Новый файл", color = OnSurfaceVar, fontSize = 13.sp)
-        }
-    }
-    Spacer(Modifier.height(12.dp))
-
-    ResultPanel("По спикерам", expandSpeaker, { expandSpeaker = !expandSpeaker }, state.speakerText) {
-        copyText(context, state.speakerText)
-    }
-    Spacer(Modifier.height(8.dp))
-
-    Card(
-        modifier = Modifier.fillMaxWidth(),
+private fun ResultPanel(title: String, expanded: Boolean, onToggle: () -> Unit, content: String, onCopy: () -> Unit) {
+    Card(modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = Surface),
         shape = RoundedCornerShape(14.dp),
-        border = BorderStroke(1.dp, SurfaceVar),
-    ) {
-        Row(Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
-            verticalAlignment = Alignment.CenterVertically) {
-            Text("Скачать файл", fontSize = 14.sp, color = OnSurface, modifier = Modifier.weight(1f))
-            TextButton(onClick = { saveToDownloads(context, state.speakerText) }) {
-                Text("⬇ .txt", color = Primary, fontSize = 13.sp)
-            }
-        }
-    }
-    Spacer(Modifier.height(8.dp))
-
-    ResultPanel("Сплошной текст", expandPlain, { expandPlain = !expandPlain }, state.fullText) {
-        copyText(context, state.fullText)
-    }
-}
-
-@Composable
-private fun ResultPanel(
-    title: String,
-    expanded: Boolean,
-    onToggle: () -> Unit,
-    content: String,
-    onCopy: () -> Unit,
-) {
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(containerColor = Surface),
-        shape = RoundedCornerShape(14.dp),
-        border = BorderStroke(1.dp, SurfaceVar),
-    ) {
+        border = BorderStroke(1.dp, SurfaceVar)) {
         Column {
-            Row(
-                Modifier.fillMaxWidth().clickable(onClick = onToggle)
-                    .padding(horizontal = 16.dp, vertical = 12.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
+            Row(Modifier.fillMaxWidth().clickable(onClick = onToggle).padding(horizontal = 16.dp, vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically) {
                 Text(title, fontSize = 14.sp, color = OnSurface, modifier = Modifier.weight(1f))
                 Text(if (expanded) "▲" else "▼", fontSize = 11.sp, color = OnSurfaceVar)
             }
             AnimatedVisibility(visible = expanded) {
                 Column {
                     Divider(color = SurfaceVar, thickness = 1.dp)
-                    Text(
-                        text = content.ifEmpty { "(пусто)" },
+                    Text(text = content.ifEmpty { "(пусто)" },
                         modifier = Modifier.fillMaxWidth().padding(16.dp),
                         fontSize = 12.sp, color = OnSurface,
-                        fontFamily = FontFamily.Monospace, lineHeight = 18.sp,
-                    )
+                        fontFamily = FontFamily.Monospace, lineHeight = 18.sp)
                     Divider(color = SurfaceVar, thickness = 1.dp)
                     Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
                         horizontalArrangement = Arrangement.End) {
-                        TextButton(onClick = onCopy) {
-                            Text("Копировать", color = Primary, fontSize = 13.sp)
-                        }
+                        TextButton(onClick = onCopy) { Text("Копировать", color = Primary, fontSize = 13.sp) }
                     }
                 }
             }
@@ -636,7 +1011,7 @@ private fun ResultPanel(
     }
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ─── Utils ────────────────────────────────────────────────────────────────────
 
 private fun copyText(context: android.content.Context, text: String) {
     val cb = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as ClipboardManager
