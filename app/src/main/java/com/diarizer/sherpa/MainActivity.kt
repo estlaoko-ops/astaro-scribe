@@ -64,6 +64,15 @@ private val AppColorScheme = darkColorScheme(
     onSurfaceVariant = OnSurfaceVar,
 )
 
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+private fun fmtDuration(sec: Long): String {
+    val m = sec / 60; val s = sec % 60
+    return if (m > 0) "%d:%02d".format(m, s) else "${s}с"
+}
+
+private data class StepEntry(val label: String, val elapsedSec: Long)
+
 // ─── UI State ─────────────────────────────────────────────────────────────────
 
 private sealed class UiState {
@@ -106,6 +115,8 @@ private fun MainScreen() {
     var jobId by remember { mutableStateOf<String?>(null) }
     var startMs by remember { mutableStateOf(0L) }
     var elapsedSec by remember { mutableStateOf(0L) }
+    var stepLog by remember { mutableStateOf(listOf<StepEntry>()) }
+    var lastLoggedStep by remember { mutableStateOf("") }
 
     // ── Elapsed timer ──────────────────────────────────────────────────────
     LaunchedEffect(startMs) {
@@ -137,7 +148,14 @@ private fun MainScreen() {
                         jobId = null
                         break
                     }
-                    else -> uiState = UiState.Processing(s.step, s.progress)
+                    else -> {
+                        if (s.step != lastLoggedStep) {
+                            lastLoggedStep = s.step
+                            val elapsed = if (startMs > 0L) (System.currentTimeMillis() - startMs) / 1000 else 0L
+                            stepLog = stepLog + StepEntry(s.step, elapsed)
+                        }
+                        uiState = UiState.Processing(s.step, s.progress)
+                    }
                 }
             } catch (_: Exception) { /* keep polling on transient errors */ }
         }
@@ -158,6 +176,8 @@ private fun MainScreen() {
     fun startUpload() {
         val uri = selectedUri ?: return
         startMs = System.currentTimeMillis()
+        stepLog = emptyList()
+        lastLoggedStep = ""
         uiState = UiState.Uploading
 
         activity.startForegroundService(
@@ -249,6 +269,10 @@ private fun MainScreen() {
                     FileCard(selectedName, 0f, compact = true, onChangeTap = null)
                     Spacer(Modifier.height(12.dp))
                     ProgressCard(s.step, s.progress, elapsedSec, s.progress < 0.01f)
+                    if (stepLog.isNotEmpty()) {
+                        Spacer(Modifier.height(8.dp))
+                        StepLogCard(stepLog)
+                    }
                 }
 
                 is UiState.Done ->
@@ -330,8 +354,10 @@ private fun FileCard(
 
 @Composable
 private fun ProgressCard(step: String, progress: Float, elapsed: Long, indeterminate: Boolean) {
-    val min = elapsed / 60; val sec = elapsed % 60
-    val timeStr = if (elapsed > 0) "  ⏱ %d:%02d".format(min, sec) else ""
+    val timeStr = if (elapsed > 0) "  ⏱ ${fmtDuration(elapsed)}" else ""
+    val etaSec = if (progress > 0.05f && elapsed > 5L)
+        (elapsed * (1.0 - progress) / progress).toLong() else -1L
+
     Card(
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = Surface),
@@ -353,7 +379,60 @@ private fun ProgressCard(step: String, progress: Float, elapsed: Long, indetermi
                     color = Primary, trackColor = SurfaceVar,
                 )
                 Spacer(Modifier.height(4.dp))
-                Text("${(progress * 100).toInt()}%", fontSize = 11.sp, color = OnSurfaceVar)
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    Text("${(progress * 100).toInt()}%", fontSize = 11.sp, color = OnSurfaceVar)
+                    if (etaSec >= 0)
+                        Text("~ещё ${fmtDuration(etaSec)}", fontSize = 11.sp, color = OnSurfaceVar)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun StepLogCard(log: List<StepEntry>) {
+    var expanded by remember { mutableStateOf(false) }
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = Surface),
+        shape = RoundedCornerShape(14.dp),
+        border = BorderStroke(1.dp, SurfaceVar),
+    ) {
+        Column {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { expanded = !expanded }
+                    .padding(horizontal = 16.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("Детали обработки", fontSize = 12.sp, color = OnSurfaceVar,
+                    modifier = Modifier.weight(1f))
+                Text(if (expanded) "▲" else "▼", fontSize = 10.sp, color = OnSurfaceVar)
+            }
+            AnimatedVisibility(visible = expanded) {
+                Column(Modifier.padding(start = 16.dp, end = 16.dp, bottom = 12.dp)) {
+                    log.forEachIndexed { i, entry ->
+                        val duration = if (i + 1 < log.size) log[i + 1].elapsedSec - entry.elapsedSec
+                                       else null
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp),
+                            verticalAlignment = Alignment.Top,
+                        ) {
+                            Text(
+                                fmtDuration(entry.elapsedSec),
+                                fontSize = 11.sp, color = Primary,
+                                fontFamily = FontFamily.Monospace,
+                                modifier = Modifier.width(48.dp),
+                            )
+                            Text(
+                                entry.label + if (duration != null) "  (+${fmtDuration(duration)})" else "",
+                                fontSize = 11.sp, color = OnSurface,
+                                modifier = Modifier.weight(1f),
+                            )
+                        }
+                    }
+                }
             }
         }
     }
