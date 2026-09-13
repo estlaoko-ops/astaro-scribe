@@ -456,6 +456,8 @@ private fun PlayerCard(
     speakerNames: Map<String, String>,
     currentSegIdx: Int,
     onCurrentSegChange: (Int) -> Unit,
+    seekPositionMs: Long = -1L,
+    onSeekConsumed: () -> Unit = {},
 ) {
     if (uri == null) return
 
@@ -506,6 +508,16 @@ private fun PlayerCard(
             if (idx != currentSegIdx) onCurrentSegChange(idx)
             delay(150)
         }
+    }
+
+    // External seek (tap on segment row)
+    LaunchedEffect(seekPositionMs) {
+        if (seekPositionMs < 0L) return@LaunchedEffect
+        val mp = mediaPlayer ?: return@LaunchedEffect
+        mp.seekTo(seekPositionMs.toInt())
+        playerPos = seekPositionMs
+        if (!isPlaying) { mp.start(); isPlaying = true }
+        onSeekConsumed()
     }
 
     val mp = mediaPlayer
@@ -589,10 +601,11 @@ private fun ResultBlock(
     onReset: () -> Unit,
 ) {
     val context = LocalContext.current
-    var expandSpeaker by remember { mutableStateOf(false) }
+    var expandSpeaker by remember { mutableStateOf(true) }
     var expandPlain by remember { mutableStateOf(false) }
     var showRenameDialog by remember { mutableStateOf(false) }
     var currentSegIdx by remember { mutableStateOf(-1) }
+    var seekPositionMs by remember { mutableStateOf(-1L) }
 
     if (showRenameDialog) {
         SpeakerRenameDialog(
@@ -619,6 +632,8 @@ private fun ResultBlock(
             speakerNames = speakerNames,
             currentSegIdx = currentSegIdx,
             onCurrentSegChange = { currentSegIdx = it },
+            seekPositionMs = seekPositionMs,
+            onSeekConsumed = { seekPositionMs = -1L },
         )
         Spacer(Modifier.height(8.dp))
     }
@@ -671,8 +686,8 @@ private fun ResultBlock(
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .background(if (isActive) color.copy(alpha = 0.10f) else Color.Transparent)
-                                    .clickable { /* tap to seek handled via player */ }
+                                    .background(if (isActive) color.copy(alpha = 0.12f) else Color.Transparent)
+                                    .clickable { seekPositionMs = (seg.start * 1000).toLong() }
                                     .padding(horizontal = 12.dp, vertical = 5.dp),
                                 verticalAlignment = Alignment.Top,
                             ) {
