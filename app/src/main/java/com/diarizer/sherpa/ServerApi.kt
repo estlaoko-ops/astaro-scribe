@@ -105,6 +105,10 @@ object ServerApi {
             ?.bufferedReader()?.readText() ?: ""
         conn.disconnect()
 
+        if (code == 404) return@withContext JobStatus(
+            status = "not_found", step = "", progress = 0f,
+            segments = null, fullText = null, errorMessage = "Задача не найдена на сервере",
+        )
         if (code != 200) throw RuntimeException("Status check failed ($code): $body")
 
         val json = JSONObject(body)
@@ -150,6 +154,16 @@ object ServerApi {
                 errorMessage = null,
             )
         }
+    }
+
+    suspend fun cancelJob(jobId: String) = withContext(Dispatchers.IO) {
+        val conn = URL("$baseUrl/pipeline/cancel/$jobId").openConnection() as HttpURLConnection
+        conn.requestMethod = "POST"
+        conn.setRequestProperty("Authorization", auth)
+        conn.connectTimeout = 10_000
+        conn.readTimeout = 10_000
+        runCatching { conn.responseCode }
+        conn.disconnect()
     }
 
     fun formatSpeakerText(segments: List<Segment>): String {

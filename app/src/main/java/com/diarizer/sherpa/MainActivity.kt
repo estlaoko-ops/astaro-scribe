@@ -34,7 +34,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import java.io.File
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 // ─── Colors ───────────────────────────────────────────────────────────────────
@@ -109,6 +111,8 @@ private fun MainScreen() {
     val activity = context as MainActivity
     val scope = rememberCoroutineScope()
 
+    val prefs = remember { context.getSharedPreferences("astaro_prefs", android.content.Context.MODE_PRIVATE) }
+
     var uiState by remember { mutableStateOf<UiState>(UiState.Idle) }
     var selectedUri by remember { mutableStateOf<Uri?>(null) }
     var selectedName by remember { mutableStateOf("") }
@@ -117,6 +121,20 @@ private fun MainScreen() {
     var elapsedSec by remember { mutableStateOf(0L) }
     var stepLog by remember { mutableStateOf(listOf<StepEntry>()) }
     var lastLoggedStep by remember { mutableStateOf("") }
+    var activeUploadJob by remember { mutableStateOf<Job?>(null) }
+
+    // ── Restore saved job on app start ────────────────────────────────────
+    LaunchedEffect(Unit) {
+        val savedId = prefs.getString("job_id", null) ?: return@LaunchedEffect
+        selectedName = prefs.getString("file_name", "") ?: ""
+        startMs = prefs.getLong("start_ms", System.currentTimeMillis())
+        uiState = UiState.Processing("Восстановление соединения...", 0f)
+        jobId = savedId
+        activity.startForegroundService(
+            Intent(activity, TranscriberService::class.java)
+                .putExtra("status_text", "Обработка продолжается...")
+        )
+    }
 
     // ── Elapsed timer ──────────────────────────────────────────────────────
     LaunchedEffect(startMs) {
@@ -136,6 +154,7 @@ private fun MainScreen() {
                 val s = ServerApi.pollStatus(id)
                 when (s.status) {
                     "done" -> {
+                        prefs.edit().remove("job_id").remove("start_ms").remove("file_name").apply()
                         activity.stopService(Intent(activity, TranscriberService::class.java))
                         val segs = s.segments ?: emptyList()
                         uiState = UiState.Done(segs, s.fullText ?: "", ServerApi.formatSpeakerText(segs))
@@ -143,8 +162,16 @@ private fun MainScreen() {
                         break
                     }
                     "error" -> {
+                        prefs.edit().remove("job_id").remove("start_ms").remove("file_name").apply()
                         activity.stopService(Intent(activity, TranscriberService::class.java))
                         uiState = UiState.Error(s.errorMessage ?: "Ошибка на сервере")
+                        jobId = null
+                        break
+                    }
+                    "not_found", "cancelled" -> {
+                        prefs.edit().remove("job_id").remove("start_ms").remove("file_name").apply()
+                        activity.stopService(Intent(activity, TranscriberService::class.java))
+                        uiState = UiState.Error(s.errorMessage ?: "Задача не найдена или отменена")
                         jobId = null
                         break
                     }
@@ -155,6 +182,11 @@ private fun MainScreen() {
                             stepLog = stepLog + StepEntry(s.step, elapsed)
                         }
                         uiState = UiState.Processing(s.step, s.progress)
+                        TranscriberService.postProgress(
+                            context, s.step,
+                            (s.progress * 100).toInt(),
+                            s.progress < 0.05f,
+                        )
                     }
                 }
             } catch (_: Exception) { /* keep polling on transient errors */ }
@@ -172,6 +204,24 @@ private fun MainScreen() {
         }
     }
 
+    // ── Cancel current job ─────────────────────────────────────────────────
+    fun cancelCurrentJob() {
+        activeUploadJob?.cancel(); activeUploadJob = null
+        val id = jobId
+        if (id != null) {
+            scope.launch { runCatching { ServerApi.cancelJob(id) } }
+            jobId = null
+        }
+        prefs.edit().remove("job_id").remove("start_ms").remove("file_name").apply()
+        activity.stopService(Intent(activity, TranscriberService::class.java))
+        startMs = 0L; stepLog = emptyList(); lastLoggedStep = ""
+        uiState = if (selectedUri != null) {
+            val sz = context.contentResolver.openFileDescriptor(selectedUri!!, "r")
+                ?.use { it.statSize / 1_048_576f } ?: 0f
+            UiState.FileSelected(selectedName, sz)
+        } else UiState.Idle
+    }
+
     // ── Upload action ──────────────────────────────────────────────────────
     fun startUpload() {
         val uri = selectedUri ?: return
@@ -185,12 +235,20 @@ private fun MainScreen() {
                 .putExtra("status_text", "Загрузка на сервер...")
         )
 
-        scope.launch {
+        activeUploadJob = scope.launch {
             try {
                 val id = ServerApi.submitJob(context, uri)
+                if (!isActive) return@launch
+                activeUploadJob = null
+                prefs.edit()
+                    .putString("job_id", id)
+                    .putLong("start_ms", startMs)
+                    .putString("file_name", selectedName)
+                    .apply()
                 jobId = id
                 uiState = UiState.Processing("Задача принята, обрабатывается...", 0f)
             } catch (e: Exception) {
+                if (!isActive) return@launch
                 activity.stopService(Intent(activity, TranscriberService::class.java))
                 uiState = UiState.Error(e.message ?: "Ошибка загрузки")
             }
@@ -262,8 +320,11 @@ private fun MainScreen() {
                     ActionButton("Загрузить и обработать") { startUpload() }
                 }
 
-                is UiState.Uploading ->
+                is UiState.Uploading -> {
                     ProgressCard("Загрузка на сервер...", 0f, elapsedSec, true)
+                    Spacer(Modifier.height(8.dp))
+                    CancelButton { cancelCurrentJob() }
+                }
 
                 is UiState.Processing -> {
                     FileCard(selectedName, 0f, compact = true, onChangeTap = null)
@@ -273,6 +334,8 @@ private fun MainScreen() {
                         Spacer(Modifier.height(8.dp))
                         StepLogCard(stepLog)
                     }
+                    Spacer(Modifier.height(8.dp))
+                    CancelButton { cancelCurrentJob() }
                 }
 
                 is UiState.Done ->
@@ -281,6 +344,8 @@ private fun MainScreen() {
                         selectedName = ""
                         jobId = null
                         startMs = 0L
+                        stepLog = emptyList()
+                        prefs.edit().remove("job_id").remove("start_ms").remove("file_name").apply()
                         uiState = UiState.Idle
                     }
 
@@ -447,6 +512,19 @@ private fun ActionButton(label: String, onClick: () -> Unit) {
         shape = RoundedCornerShape(14.dp),
     ) {
         Text(label, fontWeight = FontWeight.SemiBold, fontSize = 15.sp, color = Color.White)
+    }
+}
+
+@Composable
+private fun CancelButton(onClick: () -> Unit) {
+    OutlinedButton(
+        onClick = onClick,
+        modifier = Modifier.fillMaxWidth(),
+        colors = ButtonDefaults.outlinedButtonColors(contentColor = ErrorRed),
+        border = BorderStroke(1.dp, ErrorRed.copy(alpha = 0.4f)),
+        shape = RoundedCornerShape(14.dp),
+    ) {
+        Text("Остановить обработку", fontSize = 14.sp)
     }
 }
 

@@ -70,6 +70,7 @@ def submit():
             "status": "processing",
             "step": "В очереди...",
             "progress": 0.0,
+            "cancelled": False,
             "result": None,
             "error": None,
         }
@@ -78,6 +79,17 @@ def submit():
     t.start()
     log(f"submit: job_id={job_id}")
     return jsonify({"job_id": job_id})
+
+
+@app.route("/pipeline/cancel/<job_id>", methods=["POST"])
+def cancel(job_id):
+    with jobs_lock:
+        job = jobs.get(job_id)
+    if job is None:
+        return jsonify({"error": "not found"}), 404
+    update_job(job_id, cancelled=True, status="cancelled", step="Отменено пользователем")
+    log(f"cancel: job_id={job_id}")
+    return jsonify({"ok": True})
 
 
 @app.route("/pipeline/status/<job_id>", methods=["GET"])
@@ -119,6 +131,10 @@ def process_job(job_id: str, audio_path: str):
         if not segments:
             raise RuntimeError("Диаризация не нашла ни одного сегмента")
 
+        with jobs_lock:
+            if jobs[job_id].get("cancelled"):
+                return
+
         # 2. Convert to 16 kHz WAV for slicing
         update_job(job_id, step="Подготовка аудио для транскрибации...", progress=0.30)
         wav_path = audio_path + "_16k.wav"
@@ -135,6 +151,10 @@ def process_job(job_id: str, audio_path: str):
         full_text_parts: list[str] = []
 
         for i, seg in enumerate(segments):
+            with jobs_lock:
+                if jobs[job_id].get("cancelled"):
+                    return
+
             prog = 0.35 + 0.60 * (i / len(segments))
             update_job(job_id,
                 step=f"Транскрибация: {i+1}/{len(segments)}...",
