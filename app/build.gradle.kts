@@ -25,10 +25,6 @@ android {
             useSupportLibrary = true
         }
 
-        ndk {
-            abiFilters += listOf("arm64-v8a")
-        }
-
         buildConfigField("String", "WHISPER_SERVER_URL",
             "\"${localProps.getProperty("whisper.server.url", "")}\"")
         buildConfigField("String", "WHISPER_AUTH",
@@ -63,9 +59,6 @@ android {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
-        jniLibs {
-            useLegacyPackaging = true
-        }
     }
 }
 
@@ -79,9 +72,6 @@ dependencies {
     implementation(libs.androidx.ui.tooling.preview)
     implementation(libs.androidx.material3)
     implementation(libs.androidx.documentfile)
-
-    // sherpa-onnx AAR
-    implementation(files("libs/sherpa-onnx.aar"))
 
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)

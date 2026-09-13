@@ -1,2279 +1,473 @@
 package com.diarizer.sherpa
 
-import android.content.Context
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.ContentValues
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.os.Environment
+import android.provider.MediaStore
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.documentfile.provider.DocumentFile
-import androidx.lifecycle.lifecycleScope
-import kotlinx.coroutines.Dispatchers
+import java.io.File
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
+
+// ─── Colors ───────────────────────────────────────────────────────────────────
+
+private val Primary      = Color(0xFF818CF8)
+private val Background   = Color(0xFF060D1A)
+private val Surface      = Color(0xFF0C1829)
+private val SurfaceVar   = Color(0xFF162438)
+private val OnSurface    = Color(0xFFE2E8F0)
+private val OnSurfaceVar = Color(0xFF94A3B8)
+private val AccentIndigo = Color(0xFF4F46E5)
+private val AccentGreen  = Color(0xFF34D399)
+private val ErrorRed     = Color(0xFFF87171)
+
+private val AppColorScheme = darkColorScheme(
+    primary          = Primary,
+    secondary        = Color(0xFFA78BFA),
+    tertiary         = AccentGreen,
+    error            = ErrorRed,
+    background       = Background,
+    surface          = Surface,
+    surfaceVariant   = SurfaceVar,
+    onPrimary        = Color(0xFF1E1B4B),
+    onSecondary      = Color(0xFF2E1065),
+    onBackground     = OnSurface,
+    onSurface        = OnSurface,
+    onSurfaceVariant = OnSurfaceVar,
+)
+
+// ─── UI State ─────────────────────────────────────────────────────────────────
+
+private sealed class UiState {
+    object Idle : UiState()
+    data class FileSelected(val name: String, val sizeMb: Float) : UiState()
+    object Uploading : UiState()
+    data class Processing(val step: String, val progress: Float) : UiState()
+    data class Done(
+        val segments: List<ServerApi.Segment>,
+        val fullText: String,
+        val speakerText: String,
+    ) : UiState()
+    data class Error(val message: String) : UiState()
+}
+
+// ─── Activity ─────────────────────────────────────────────────────────────────
 
 class MainActivity : ComponentActivity() {
-    private val TAG = "MainActivity"
-    private var pipeline: Pipeline? = null
-    private var savedDecodedAudio: Pipeline.DecodedAudio? = null
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        pipeline = Pipeline(this)
-
         setContent {
-            MaterialTheme(
-                colorScheme = DarkColorScheme
-            ) {
-                MainScreen(
-                    pipeline = pipeline,
-                    context = this,
-                    onRunSpeakerTimeline = { uri, filename, onProgress, onLog, onResult, onTimelineObject, onError ->
-                        startService(Intent(this@MainActivity, TranscriberService::class.java))
-                        lifecycleScope.launch {
-                            try {
-                                onProgress("Декодирую аудио...")
-                                val decoded = withContext(Dispatchers.IO) {
-                                    AudioDecoder.decodeToAudio(this@MainActivity, uri)
-                                }
-                                if (decoded == null) {
-                                    onError("Не удалось декодировать аудио")
-                                    return@launch
-                                }
-                                savedDecodedAudio = decoded
-                                onLog("[ДЕКОДЕР] Аудио: ${(decoded.samples?.size ?: decoded.numSamples)} семплов, ${decoded.sampleRate}Гц, длительность ${"%.1f".format((decoded.samples?.size ?: decoded.numSamples).toFloat() / decoded.sampleRate)}с")
-
-                                onProgress("Загружаю модели диаризации...")
-                                if (pipeline?.isDiarizationLoaded() != true) {
-                                    val loaded = withContext(Dispatchers.IO) {
-                                        pipeline?.loadDiarizationModels() ?: false
-                                    }
-                                    if (!loaded) {
-                                        onError("Модели диаризации не загружены")
-                                        return@launch
-                                    }
-                                }
-                                onProgress("Извлекаю эмбеддинги...")
-                                val timeline = withContext(Dispatchers.IO) {
-                                    pipeline?.runSpeakerTimeline(
-                                        audio = decoded,
-                                        onProgress = { msg -> onProgress(msg) },
-                                        onLog = { msg -> onLog(msg) }
-                                    )
-                                }
-                                if (timeline != null) {
-                                    // Format the result string
-                                    val sb = StringBuilder()
-                                    sb.appendLine("Найдено спикеров: ${timeline.speakerCount}")
-                                    sb.appendLine()
-                                    sb.appendLine("Таймлайн:")
-                                    for (seg in timeline.segments) {
-                                        val spkName = "Спикер ${seg.speakerId + 1}"
-                                        sb.appendLine("[${"%.1fс".format(seg.startSec)} — ${"%.1fс".format(seg.endSec)}] $spkName")
-                                    }
-                                    onResult(sb.toString().trimEnd())
-                                    onTimelineObject(timeline)
-                                    stopService(Intent(this@MainActivity, TranscriberService::class.java))
-                                } else {
-                                    onError("Ошибка ML-диаризации")
-                                    stopService(Intent(this@MainActivity, TranscriberService::class.java))
-                                }
-                                // Не чистим savedDecodedAudio — он нужен для onTranscribeDiarizationSegments
-                            } catch (e: Exception) {
-                                onError("Ошибка: ${e.message}")
-                                stopService(Intent(this@MainActivity, TranscriberService::class.java))
-                            }
-                        }
-                    },
-                    onTranscribeDiarizationSegments = { segments, uri, onProgress, onLog, onComplete, onError ->
-                        startService(Intent(this@MainActivity, TranscriberService::class.java))
-                        lifecycleScope.launch {
-                            try {
-                                var audio = savedDecodedAudio
-                                if (audio == null && uri != null) {
-                                    onLog("[ДЕКОДЕР] 🔄 savedDecodedAudio=null, передекодирую из URI...")
-                                    audio = withContext(Dispatchers.IO) {
-                                        AudioDecoder.decodeToAudio(this@MainActivity, uri)
-                                    }
-                                    if (audio != null) {
-                                        savedDecodedAudio = audio
-                                    }
-                                }
-                                if (audio == null) {
-                                    onError("Нет декодированного аудио. Сначала выполните диаризацию (альфа).")
-                                    return@launch
-                                }
-                                val cacheDir = java.io.File(cacheDir, "segments")
-                                cacheDir.mkdirs()
-                                cacheDir.listFiles()?.forEach { it.delete() }
-                                val result = withContext(Dispatchers.IO) {
-                                    pipeline?.transcribeSegments(
-                                        audio = audio,
-                                        segments = segments,
-                                        cacheDir = cacheDir,
-                                        onProgress = { msg -> onProgress(msg) },
-                                        onLog = { msg -> onLog(msg) }
-                                    ) ?: emptyList()
-                                }
-                                onComplete(result)
-                            } catch (e: Exception) {
-                                onError("Ошибка: ${e.message}")
-                            } finally {
-                                savedDecodedAudio?.cleanup()
-                                savedDecodedAudio = null
-                                stopService(Intent(this@MainActivity, TranscriberService::class.java))
-                                onProgress("")
-                            }
-                        }
-                    },
-                    onClearAudio = {
-                        savedDecodedAudio?.cleanup()
-                        savedDecodedAudio = null
-                    }
-                )
+            MaterialTheme(colorScheme = AppColorScheme) {
+                MainScreen()
             }
         }
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        savedDecodedAudio?.cleanup()
-        savedDecodedAudio = null
-        pipeline?.release()
     }
 }
 
-private val DarkColorScheme = darkColorScheme(
-    primary = Color(0xFF818CF8),
-    secondary = Color(0xFFA78BFA),
-    tertiary = Color(0xFF34D399),
-    error = Color(0xFFF87171),
-    background = Color(0xFF060D1A),
-    surface = Color(0xFF0C1829),
-    surfaceVariant = Color(0xFF162438),
-    onPrimary = Color(0xFF1E1B4B),
-    onSecondary = Color(0xFF2E1065),
-    onBackground = Color(0xFFE2E8F0),
-    onSurface = Color(0xFFE2E8F0),
-    onSurfaceVariant = Color(0xFF94A3B8),
-)
+// ─── Main Screen ──────────────────────────────────────────────────────────────
 
 @Composable
-fun MainScreen(
-    pipeline: Pipeline?,
-    context: Context,
-    onRunSpeakerTimeline: (
-        uri: Uri,
-        filename: String,
-        onProgress: (String) -> Unit,
-        onLog: (String) -> Unit,
-        onResult: (String) -> Unit,
-        onTimelineObject: (Pipeline.SpeakerTimeline) -> Unit,
-        onError: (String) -> Unit
-    ) -> Unit = { _, _, _, _, _, _, _ -> },
-    onTranscribeDiarizationSegments: (
-        segments: List<Pipeline.SpeakerSegment>,
-        uri: android.net.Uri?,
-        onProgress: (String) -> Unit,
-        onLog: (String) -> Unit,
-        onComplete: (List<Pipeline.TranscribedSegment>) -> Unit,
-        onError: (String) -> Unit
-    ) -> Unit = { _, _, _, _, _, _ -> },
-    onClearAudio: () -> Unit = {}
-) {
+private fun MainScreen() {
+    val context = LocalContext.current
+    val activity = context as MainActivity
     val scope = rememberCoroutineScope()
-    val scrollState = rememberScrollState()
 
-    val prefs = context.getSharedPreferences("astaro_prefs", Context.MODE_PRIVATE)
-    var remoteAsrEnabled by remember { mutableStateOf(prefs.getBoolean("remote_asr_enabled", false)) }
-
-    var isInitialized by remember { mutableStateOf(false) }
-    var isDownloading by remember { mutableStateOf(false) }
-    var downloadProgress by remember { mutableStateOf("") }
-    var isProcessing by remember { mutableStateOf(false) }
-    var progress by remember { mutableStateOf("") }
-    var result by remember { mutableStateOf("") }
-    var selectedFilename by remember { mutableStateOf("") }
-    var error by remember { mutableStateOf("") }
+    var uiState by remember { mutableStateOf<UiState>(UiState.Idle) }
     var selectedUri by remember { mutableStateOf<Uri?>(null) }
-    var initError by remember { mutableStateOf("") }
-    var logFileCreated by remember { mutableStateOf(false) }
-    var fileLogger by remember { mutableStateOf<FileLogger?>(null) }
+    var selectedName by remember { mutableStateOf("") }
+    var jobId by remember { mutableStateOf<String?>(null) }
+    var startMs by remember { mutableStateOf(0L) }
+    var elapsedSec by remember { mutableStateOf(0L) }
 
-    // Logs dialog state
-    var showLogsDialog by remember { mutableStateOf(false) }
-    var showSettingsDialog by remember { mutableStateOf(false) }
-    var settingsThresholdText by remember { mutableStateOf("") }
-    var settingsThresholdError by remember { mutableStateOf(false) }
-    var settingsRemoteEnabled by remember { mutableStateOf(false) }
-    var previousLogs by remember { mutableStateOf<List<FileLogger.SavedLog>>(emptyList()) }
-    var selectedLog by remember { mutableStateOf<Pair<String, String>?>(null) }
-
-    val logLines = remember { mutableStateListOf<String>() }
-    val clipboardManager = LocalClipboardManager.current
-
-    // Diarization in progress
-    var diarizationInProgress by remember { mutableStateOf(false) }
-
-    // Speaker timeline modal
-    var speakerTimelineResult by remember { mutableStateOf("") }
-    var showSpeakerTimelineModal by remember { mutableStateOf(false) }
-    // Structured timeline data for player
-    var timelineSegments by remember { mutableStateOf<List<Pipeline.SpeakerSegment>>(emptyList()) }
-    var timelineSpeakerCount by remember { mutableStateOf(0) }
-    var timelineAudioUri by remember { mutableStateOf<Uri?>(null) }
-
-    // Transcribed segments (after slicing + transcribing each diarization segment)
-    var transcribedSegments by remember { mutableStateOf<List<Pipeline.TranscribedSegment>>(emptyList()) }
-    var showTranscribedModal by remember { mutableStateOf(false) }
-    var transcribingSegments by remember { mutableStateOf(false) }
-
-    // Speaker config persistence (survives modal close, resets on new diarization)
-    data class SpeakerConfig(val id: Int, val name: String, val mergedInto: Int?)
-    var speakerConfigs by remember(transcribedSegments) {
-        val ids = transcribedSegments.map { it.speakerId }.distinct().sorted()
-        mutableStateOf(ids.map { SpeakerConfig(it, "", null) })
-    }
-    var showSpeakerConfigDialog by remember { mutableStateOf(false) }
-    var editConfigs by remember { mutableStateOf<List<SpeakerConfig>>(emptyList()) }
-    // Mini speaker config dialog (single speaker)
-    var miniConfigSpeakerId by remember { mutableIntStateOf(-1) }
-    // Dialogue text for main screen result (recomputed when configs change)
-    val dialogueText = remember(transcribedSegments, speakerConfigs) {
-        val cfgs = speakerConfigs
-        transcribedSegments.filter { it.text.isNotEmpty() }.joinToString("\n\n") { seg ->
-            val cfg = cfgs.find { c -> c.id == seg.speakerId }
-            val effId = cfg?.mergedInto ?: seg.speakerId
-            val effCfg = cfgs.find { c -> c.id == effId }
-            val name = effCfg?.name?.takeIf { it.isNotBlank() } ?: "Спикер ${effId + 1}"
-            "$name: ${seg.text}"
+    // ── Elapsed timer ──────────────────────────────────────────────────────
+    LaunchedEffect(startMs) {
+        if (startMs == 0L) { elapsedSec = 0L; return@LaunchedEffect }
+        while (true) {
+            elapsedSec = (System.currentTimeMillis() - startMs) / 1000
+            delay(1_000)
         }
     }
 
-    // Version history dialog
-    var showVersionHistory by remember { mutableStateOf(false) }
-    val versionHistory = listOf(
-        "v6.9 · Phoenicia · Whisper Small INT8 · Astaro",
-        "v6.8 · Hittite · Whisper Small INT8 · Astaro",
-        "v6.7 · Assyria · Whisper Small INT8",
-        "v6.6 · Babylon · Whisper Small INT8",
-        "v6.5 · Sumer · Whisper Small INT8",
-        "v6.4 · Bactria · Whisper Small INT8",
-        "v6.3 · Carthage · Whisper Small INT8",
-        "v6.2 · Akkad · Whisper Small INT8",
-        "v6.1 · Elam · Whisper Small INT8",
-        "v6.0 · Songhai · Whisper Small INT8",
-    )
-
-    // Timer for real-time elapsed time display
-    var processingStartMs by remember { mutableStateOf(0L) }
-    var baseProgress by remember { mutableStateOf("") }
-
-    // Auto-scroll logs
-    LaunchedEffect(logLines.size) {
-        if (logLines.isNotEmpty()) {
-            scrollState.animateScrollTo(scrollState.maxValue)
-        }
-    }
-
-    // Real-time timer: ticks every second during processing
-    LaunchedEffect(isProcessing, processingStartMs) {
-        if (isProcessing && processingStartMs > 0L) {
-            while (isProcessing) {
-                val elapsed = System.currentTimeMillis() - processingStartMs
-                val min = elapsed / 60000; val sec = (elapsed % 60000) / 1000
-                val elapsedStr = "$min:${"%02d".format(sec)}"
-                progress = if (baseProgress.isNotEmpty()) {
-                    "$baseProgress ⏱$elapsedStr"
-                } else {
-                    "⏱ $elapsedStr"
-                }
-                delay(1000)
-            }
-        }
-    }
-
-    // Reactively update main screen result when speaker configs change
-    LaunchedEffect(dialogueText) {
-        if (transcribedSegments.isNotEmpty() && dialogueText.isNotEmpty()) {
-            result = dialogueText
-        }
-    }
-
-    // Check if models exist, create log file
-    LaunchedEffect(Unit) {
-        val logger = FileLogger(context)
-        fileLogger = logger
-        pipeline?.setFileLogger(logger)
-
-        previousLogs = logger.getPreviousLogs()
-
-        logLines.add("[СИСТЕМА] Лог-файл: ${logger.getPath()}")
-        logger.log("=== ПРИЛОЖЕНИЕ ЗАПУЩЕНО ===")
-        logger.log("Модели загружены: ${ModelDownloader.areAllModelsDownloaded(context)}")
-
-        if (ModelDownloader.areAllModelsDownloaded(context)) {
-            logger.log("Модели найдены, инициализирую Pipeline...")
-            val success = withContext(Dispatchers.IO) {
-                pipeline?.loadModels() ?: false
-            }
-            if (success) {
-                logger.log("Pipeline инициализирован успешно")
-                                logLines.add("[СИСТЕМА] ✅ Whisper Small INT8 + ML-диаризация (бета) готовы")
-            } else {
-                logger.logError("Pipeline НЕ инициализирован")
-                logLines.add("[СИСТЕМА] ❌ Ошибка инициализации Pipeline")
-                initError = "Ошибка загрузки моделей. Скачайте их заново."
-            }
-            isInitialized = success
-        } else {
-            logger.log("Модели не найдены — требуется загрузка")
-            if (remoteAsrEnabled) {
-                logLines.add("[СИСТЕМА] Режим: Whisper Turbo (сервер). Локальные модели не загружены.")
-            } else {
-                logLines.add("[СИСТЕМА] Модели не найдены. Нажмите «Загрузить модели».")
-            }
-        }
-
-        logFileCreated = true
-    }
-
-    val filePickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocument()
-    ) { uri ->
-        uri?.let {
-            onClearAudio()
-            val docFile = DocumentFile.fromSingleUri(context, it)
-            selectedFilename = docFile?.name ?: "audio file"
-            selectedUri = it
-            result = ""
-            error = ""
-            logLines.clear()
-            speakerTimelineResult = ""
-            showSpeakerTimelineModal = false
-            transcribedSegments = emptyList()
-            showTranscribedModal = false
-            transcribingSegments = false
-            logLines.add("[СИСТЕМА] Выбран файл: ${docFile?.name}")
-            fileLogger?.log("Выбран файл: ${docFile?.name}")
-        }
-    }
-
-    // ===== LOGS DIALOG =====
-    if (showLogsDialog) {
-        AlertDialog(
-            onDismissRequest = {
-                showLogsDialog = false
-                selectedLog = null
-            },
-            title = {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        text = if (selectedLog != null) "📄 ${selectedLog!!.first}" else "📋 Логи",
-                        color = MaterialTheme.colorScheme.primary,
-                        fontWeight = FontWeight.Bold
-                    )
-                    if (selectedLog != null) {
-                        TextButton(
-                            onClick = { selectedLog = null },
-                            contentPadding = PaddingValues(horizontal = 4.dp)
-                        ) { Text("← Назад", fontSize = 12.sp) }
+    // ── Status polling ─────────────────────────────────────────────────────
+    LaunchedEffect(jobId) {
+        val id = jobId ?: return@LaunchedEffect
+        while (true) {
+            delay(5_000)
+            try {
+                val s = ServerApi.pollStatus(id)
+                when (s.status) {
+                    "done" -> {
+                        activity.stopService(Intent(activity, TranscriberService::class.java))
+                        val segs = s.segments ?: emptyList()
+                        uiState = UiState.Done(segs, s.fullText ?: "", ServerApi.formatSpeakerText(segs))
+                        jobId = null
+                        break
                     }
-                }
-            },
-            text = {
-                if (selectedLog != null) {
-                    // ===== SELECTED LOG VIEW =====
-                    Column {
-                        val isTruncated = selectedLog!!.second.length > 4000
-                        val displayText = if (isTruncated)
-                            "... (последние 4000 символов)\n\n${selectedLog!!.second.takeLast(4000)}"
-                        else
-                            selectedLog!!.second
-                        Row(
-                            modifier = Modifier.fillMaxWidth().padding(bottom = 4.dp),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(
-                                text = "👆 Тап — скопировать",
-                                fontSize = 10.sp,
-                                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.4f)
-                            )
-                            if (isTruncated) {
-                                TextButton(
-                                    onClick = {
-                                        clipboardManager.setText(AnnotatedString(selectedLog!!.second))
-                                        Toast.makeText(context, "Весь лог скопирован!", Toast.LENGTH_SHORT).show()
-                                    },
-                                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp)
-                                ) { Text("📋 Копировать всё", fontSize = 10.sp) }
-                            }
-                        }
-                        Surface(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(420.dp)
-                                .verticalScroll(rememberScrollState())
-                                .clickable {
-                                    clipboardManager.setText(AnnotatedString(displayText))
-                                    Toast.makeText(context, "Скопировано!", Toast.LENGTH_SHORT).show()
-                                },
-                            color = Color(0xFF0D1117),
-                            shape = MaterialTheme.shapes.small
-                        ) {
-                            Text(
-                                text = displayText,
-                                modifier = Modifier.padding(8.dp),
-                                fontSize = 10.sp,
-                                fontFamily = FontFamily.Monospace,
-                                lineHeight = 14.sp,
-                                color = Color(0xFF58A6FF),
-                                softWrap = true
-                            )
-                        }
+                    "error" -> {
+                        activity.stopService(Intent(activity, TranscriberService::class.java))
+                        uiState = UiState.Error(s.errorMessage ?: "Ошибка на сервере")
+                        jobId = null
+                        break
                     }
-                } else {
-                    // ===== LOGS LIST VIEW =====
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(max = 480.dp)
-                            .verticalScroll(rememberScrollState())
-                    ) {
-                        // Current session logs
-                        if (logLines.isNotEmpty()) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth().padding(bottom = 4.dp),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text(
-                                    text = "Текущая сессия",
-                                    fontSize = 12.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    color = MaterialTheme.colorScheme.primary
-                                )
-                                TextButton(
-                                    onClick = {
-                                        clipboardManager.setText(AnnotatedString(logLines.joinToString("\n")))
-                                        Toast.makeText(context, "Лог скопирован!", Toast.LENGTH_SHORT).show()
-                                    },
-                                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp)
-                                ) { Text("📋 Копировать", fontSize = 11.sp) }
-                            }
-                            Surface(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .heightIn(max = 220.dp)
-                                    .verticalScroll(rememberScrollState())
-                                    .clickable {
-                                        clipboardManager.setText(AnnotatedString(logLines.joinToString("\n")))
-                                        Toast.makeText(context, "Лог скопирован!", Toast.LENGTH_SHORT).show()
-                                    },
-                                color = Color(0xFF0D1117),
-                                shape = MaterialTheme.shapes.small
-                            ) {
-                                Text(
-                                    text = logLines.joinToString("\n"),
-                                    modifier = Modifier.padding(8.dp),
-                                    fontSize = 10.sp,
-                                    fontFamily = FontFamily.Monospace,
-                                    lineHeight = 14.sp,
-                                    color = Color(0xFF58A6FF),
-                                    softWrap = true
-                                )
-                            }
-                        } else {
-                            Surface(
-                                modifier = Modifier.fillMaxWidth().padding(bottom = 4.dp),
-                                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f),
-                                shape = MaterialTheme.shapes.small
-                            ) {
-                                Text(
-                                    text = "Текущая сессия: логов пока нет. Выберите файл и запустите обработку.",
-                                    fontSize = 11.sp,
-                                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f),
-                                    modifier = Modifier.padding(10.dp)
-                                )
-                            }
-                        }
+                    else -> uiState = UiState.Processing(s.step, s.progress)
+                }
+            } catch (_: Exception) { /* keep polling on transient errors */ }
+        }
+    }
 
-                        // Previous sessions
-                        if (previousLogs.isNotEmpty()) {
-                            Divider(
-                                color = MaterialTheme.colorScheme.surfaceVariant,
-                                modifier = Modifier.padding(vertical = 10.dp)
-                            )
-                            Text(
-                                text = "Предыдущие сессии",
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
-                                modifier = Modifier.padding(bottom = 6.dp)
-                            )
-                            previousLogs.forEach { log ->
-                                Card(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(vertical = 3.dp)
-                                        .clickable {
-                                            selectedLog = Pair("${log.date} — ${log.name}", log.content)
-                                        },
-                                    colors = CardDefaults.cardColors(
-                                        containerColor = if (log.name.contains("CRASH"))
-                                            MaterialTheme.colorScheme.error.copy(alpha = 0.15f)
-                                        else
-                                            MaterialTheme.colorScheme.surfaceVariant
-                                    )
-                                ) {
-                                    Row(
-                                        modifier = Modifier.padding(10.dp),
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        Text(
-                                            text = if (log.name.contains("CRASH")) "💥" else "📄",
-                                            fontSize = 16.sp
-                                        )
-                                        Spacer(Modifier.width(8.dp))
-                                        Column(modifier = Modifier.weight(1f)) {
-                                            Text(
-                                                text = log.date,
-                                                fontSize = 11.sp,
-                                                fontWeight = FontWeight.Bold,
-                                                color = MaterialTheme.colorScheme.onSurface
-                                            )
-                                            Text(
-                                                text = log.name,
-                                                fontSize = 10.sp,
-                                                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f)
-                                            )
-                                        }
-                                        Text(
-                                            text = "→",
-                                            fontSize = 14.sp,
-                                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.3f)
-                                        )
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            },
-            confirmButton = {
-                TextButton(onClick = {
-                    showLogsDialog = false
-                    selectedLog = null
-                }) {
-                    Text("Закрыть")
-                }
-            },
-            containerColor = MaterialTheme.colorScheme.background
+    // ── File picker ────────────────────────────────────────────────────────
+    val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        if (uri != null) {
+            selectedUri = uri
+            selectedName = uri.lastPathSegment?.substringAfterLast('/') ?: "audio"
+            val sizeMb = context.contentResolver.openFileDescriptor(uri, "r")
+                ?.use { it.statSize / 1_048_576f } ?: 0f
+            uiState = UiState.FileSelected(selectedName, sizeMb)
+        }
+    }
+
+    // ── Upload action ──────────────────────────────────────────────────────
+    fun startUpload() {
+        val uri = selectedUri ?: return
+        startMs = System.currentTimeMillis()
+        uiState = UiState.Uploading
+
+        activity.startForegroundService(
+            Intent(activity, TranscriberService::class.java)
+                .putExtra("status_text", "Загрузка на сервер...")
         )
-    }
 
-    // ===== VERSION HISTORY DIALOG =====
-    if (showVersionHistory) {
-        AlertDialog(
-            onDismissRequest = { showVersionHistory = false },
-            title = {
-                Text(
-                    "🏛 История версий",
-                    color = MaterialTheme.colorScheme.primary,
-                    fontWeight = FontWeight.Bold
-                )
-            },
-            text = {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(max = 300.dp)
-                        .verticalScroll(rememberScrollState())
-                ) {
-                    versionHistory.forEachIndexed { i, ver ->
-                        Surface(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(vertical = 3.dp),
-                            shape = MaterialTheme.shapes.small,
-                            color = if (i == 0)
-                                MaterialTheme.colorScheme.primary.copy(alpha = 0.15f)
-                            else
-                                Color.Transparent
-                        ) {
-                            Text(
-                                text = if (i == 0) "⭐ $ver (текущая)" else ver,
-                                fontSize = 13.sp,
-                                color = MaterialTheme.colorScheme.onSurface,
-                                modifier = Modifier.padding(8.dp)
-                            )
-                        }
-                    }
-                }
-            },
-            confirmButton = {
-                TextButton(onClick = { showVersionHistory = false }) {
-                    Text("Закрыть")
-                }
-            },
-            containerColor = MaterialTheme.colorScheme.background
-        )
-    }
-
-    // ===== SETTINGS DIALOG =====
-    if (showSettingsDialog) {
-        val currentThreshold = pipeline?.clusterThreshold ?: 0.45f
-        LaunchedEffect(showSettingsDialog) {
-            settingsThresholdText = currentThreshold.toString()
-            settingsThresholdError = false
-            settingsRemoteEnabled = remoteAsrEnabled
+        scope.launch {
+            try {
+                val id = ServerApi.submitJob(context, uri)
+                jobId = id
+                uiState = UiState.Processing("Задача принята, обрабатывается...", 0f)
+            } catch (e: Exception) {
+                activity.stopService(Intent(activity, TranscriberService::class.java))
+                uiState = UiState.Error(e.message ?: "Ошибка загрузки")
+            }
         }
-        AlertDialog(
-            onDismissRequest = {
-                showSettingsDialog = false
-                settingsThresholdText = ""
-                settingsThresholdError = false
-                settingsRemoteEnabled = remoteAsrEnabled
-            },
-            title = {
-                Text(
-                    text = "⚙ Настройки",
-                    color = MaterialTheme.colorScheme.primary,
-                    fontWeight = FontWeight.Bold
-                )
-            },
-            text = {
-                Column(modifier = Modifier.fillMaxWidth()) {
-                    // Compact mode switch
-
-
-                    Text(
-                        text = "Порог кластеризации (clusterThreshold)",
-                        fontSize = 13.sp,
-                        fontWeight = FontWeight.Medium
-                    )
-                    Spacer(Modifier.height(4.dp))
-                    OutlinedTextField(
-                        value = settingsThresholdText,
-                        onValueChange = { newVal ->
-                            settingsThresholdText = newVal
-                            settingsThresholdError = false
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                        singleLine = true,
-                        isError = settingsThresholdError,
-                        supportingText = if (settingsThresholdError) {
-                            { Text("Введите число от 0.01 до 0.99", color = MaterialTheme.colorScheme.error) }
-                        } else null
-                    )
-                    Spacer(Modifier.height(4.dp))
-                    Text(
-                        text = "Рекомендуется 0.45. Меньше число = больше спикеров",
-                        fontSize = 11.sp,
-                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f)
-                    )
-                    Spacer(Modifier.height(8.dp))
-                    Text(
-                        text = "Текущее значение: ${currentThreshold}",
-                        fontSize = 11.sp,
-                        color = MaterialTheme.colorScheme.primary.copy(alpha = 0.7f)
-                    )
-
-                    Divider(color = MaterialTheme.colorScheme.surfaceVariant, modifier = Modifier.padding(vertical = 12.dp))
-
-                    // Remote Whisper ASR
-                    Row(
-                        modifier = Modifier.fillMaxWidth().padding(bottom = 4.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = "Whisper Turbo (сервер)",
-                                fontSize = 14.sp,
-                                fontWeight = FontWeight.Medium,
-                                color = MaterialTheme.colorScheme.onSurface
-                            )
-                            Text(
-                                text = "Транскрибировать через облачный Whisper Turbo вместо локальной модели",
-                                fontSize = 11.sp,
-                                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f)
-                            )
-                        }
-                        Spacer(Modifier.width(8.dp))
-                        Switch(
-                            checked = settingsRemoteEnabled,
-                            onCheckedChange = { settingsRemoteEnabled = it }
-                        )
-                    }
-                }
-            },
-            confirmButton = {
-                TextButton(onClick = {
-                    val threshold = settingsThresholdText.toFloatOrNull()
-                    if (threshold != null && threshold > 0f && threshold < 1f) {
-                        pipeline?.setClusterThreshold(threshold)
-                        pipeline?.setRemoteAsr(settingsRemoteEnabled)
-                        remoteAsrEnabled = settingsRemoteEnabled
-                        showSettingsDialog = false
-                        settingsThresholdText = ""
-                        settingsThresholdError = false
-                        logLines.add("[НАСТРОЙКИ] Порог кластеризации = $threshold")
-                        logLines.add("[НАСТРОЙКИ] Режим ASR: ${if (settingsRemoteEnabled) "Whisper Turbo (сервер)" else "локальный"}")
-                    } else {
-                        settingsThresholdError = true
-                    }
-                }) {
-                    Text("💾 Сохранить", fontSize = 14.sp)
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = {
-                    showSettingsDialog = false
-                    settingsThresholdText = ""
-                    settingsThresholdError = false
-                    settingsRemoteEnabled = remoteAsrEnabled
-                }) {
-                    Text("Отмена", fontSize = 14.sp)
-                }
-            },
-            containerColor = MaterialTheme.colorScheme.background
-        )
     }
 
-    // ===== MAIN UI =====
-    Surface(
-        modifier = Modifier.fillMaxSize(),
-        color = MaterialTheme.colorScheme.background
-    ) {
+    // ── Layout ─────────────────────────────────────────────────────────────
+    Surface(modifier = Modifier.fillMaxSize(), color = Background) {
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(horizontal = 20.dp)
-                .padding(top = 20.dp, bottom = 12.dp),
-            verticalArrangement = Arrangement.Top
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 20.dp),
         ) {
-            // ===== HEADER =====
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Column(
-                    modifier = Modifier
-                        .weight(1f)
-                        .clickable { showVersionHistory = true }
-                ) {
-                    Text(
-                        text = "Astaro",
-                        fontSize = 26.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.onBackground,
-                        letterSpacing = (-0.5f).sp
-                    )
-                    Text(
-                        text = "v6.9 · Phoenicia",
-                        fontSize = 11.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-                IconButton(onClick = { showSettingsDialog = true }) {
-                    Icon(
-                        imageVector = Icons.Default.Settings,
-                        contentDescription = "Настройки",
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.size(22.dp)
-                    )
-                }
-                IconButton(
-                    onClick = {
-                        fileLogger?.let { previousLogs = it.getPreviousLogs() }
-                        showLogsDialog = true
-                        selectedLog = null
-                    }
-                ) {
-                    Text(
-                        text = "≡",
-                        fontSize = 20.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-            }
+            Spacer(Modifier.height(56.dp))
 
-            Spacer(Modifier.height(20.dp))
+            Text(
+                "Astaro Scribe",
+                style = TextStyle(fontSize = 22.sp, fontWeight = FontWeight.Bold,
+                    color = Primary, letterSpacing = 0.3.sp),
+            )
+            Text("v7.0", style = TextStyle(fontSize = 12.sp, color = OnSurfaceVar))
+            Spacer(Modifier.height(28.dp))
 
-            // ===== ERROR CARD =====
-            if (error.isNotEmpty()) {
-                Card(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(bottom = 12.dp)
-                        .clickable {
-                            clipboardManager.setText(AnnotatedString(error))
-                            Toast.makeText(context, "Скопировано!", Toast.LENGTH_SHORT).show()
-                        },
-                    shape = RoundedCornerShape(12.dp),
-                    colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.error.copy(alpha = 0.10f)
-                    ),
-                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.error.copy(alpha = 0.35f))
-                ) {
-                    Text(
-                        text = error,
-                        color = MaterialTheme.colorScheme.error,
-                        fontSize = 12.sp,
-                        modifier = Modifier.padding(12.dp)
-                    )
-                }
-            }
+            when (val s = uiState) {
+                is UiState.Idle ->
+                    PickerCard { filePicker.launch("audio/*") }
 
-            val isReady = isInitialized || remoteAsrEnabled
-
-            // ===== DOWNLOAD STATE =====
-            if (!isReady) {
-                Spacer(Modifier.height(8.dp))
-                if (isDownloading) {
-                    Card(
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(20.dp),
-                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.surfaceVariant)
-                    ) {
-                        Column(modifier = Modifier.padding(20.dp)) {
-                            Text(
-                                text = "Загрузка моделей...",
-                                fontWeight = FontWeight.SemiBold,
-                                fontSize = 15.sp,
-                                color = MaterialTheme.colorScheme.onSurface
-                            )
-                            Spacer(Modifier.height(4.dp))
-                            Text(
-                                text = downloadProgress,
-                                fontSize = 12.sp,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                            Spacer(Modifier.height(14.dp))
-                            LinearProgressIndicator(
-                                modifier = Modifier.fillMaxWidth(),
-                                color = MaterialTheme.colorScheme.primary,
-                                trackColor = MaterialTheme.colorScheme.surfaceVariant
-                            )
-                        }
-                    }
-                } else {
-                    Card(
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(20.dp),
-                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.surfaceVariant)
-                    ) {
-                        Column(modifier = Modifier.padding(20.dp)) {
-                            Text(
-                                text = "Необходимы модели",
-                                fontWeight = FontWeight.SemiBold,
-                                fontSize = 15.sp,
-                                color = MaterialTheme.colorScheme.onSurface
-                            )
-                            Spacer(Modifier.height(4.dp))
-                            Text(
-                                text = "Whisper Small INT8 + ML-диаризация · ~358 МБ",
-                                fontSize = 12.sp,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                            Spacer(Modifier.height(16.dp))
-                            Button(
-                                onClick = {
-                                    context.startService(Intent(context, TranscriberService::class.java))
-                                    isDownloading = true
-                                    scope.launch {
-                                        try {
-                                            fileLogger?.log("=== ЗАГРУЗКА МОДЕЛЕЙ ===")
-                                            ModelDownloader.downloadModels(context) { msg, _ ->
-                                                downloadProgress = msg
-                                                fileLogger?.log("[DL] $msg")
-                                            }
-                                            val success = withContext(Dispatchers.IO) {
-                                                pipeline?.loadModels() ?: false
-                                            }
-                                            isInitialized = success
-                                            isDownloading = false
-                                            downloadProgress = ""
-                                            if (success) {
-                                                logLines.add("[СИСТЕМА] ✅ Готово")
-                                                fileLogger?.log("Модели загружены")
-                                                Toast.makeText(context, "Модели загружены!", Toast.LENGTH_SHORT).show()
-                                            } else {
-                                                error = "Не удалось загрузить модели"
-                                                fileLogger?.logError("Не удалось загрузить модели")
-                                            }
-                                        } catch (e: Exception) {
-                                            error = "Ошибка загрузки: ${e.message}"
-                                            fileLogger?.logError("Ошибка загрузки", e)
-                                            isDownloading = false
-                                            downloadProgress = ""
-                                        } finally {
-                                            context.stopService(Intent(context, TranscriberService::class.java))
-                                        }
-                                    }
-                                },
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .height(48.dp),
-                                shape = RoundedCornerShape(12.dp)
-                            ) {
-                                Text("Загрузить модели", fontWeight = FontWeight.Medium)
-                            }
-                        }
-                    }
-                }
-            }
-
-            // ===== READY STATE =====
-            if (isReady) {
-                // Mode pill
-                Surface(
-                    shape = RoundedCornerShape(20.dp),
-                    color = MaterialTheme.colorScheme.tertiary.copy(alpha = 0.10f),
-                    modifier = Modifier.padding(bottom = 16.dp)
-                ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Surface(
-                            modifier = Modifier.size(6.dp),
-                            shape = RoundedCornerShape(3.dp),
-                            color = MaterialTheme.colorScheme.tertiary
-                        ) {}
-                        Spacer(Modifier.width(6.dp))
-                        Text(
-                            text = if (remoteAsrEnabled) "Whisper Turbo (сервер)" else "Whisper Small INT8",
-                            fontSize = 11.sp,
-                            color = MaterialTheme.colorScheme.tertiary,
-                            fontWeight = FontWeight.Medium
-                        )
-                    }
+                is UiState.FileSelected -> {
+                    FileCard(s.name, s.sizeMb) { filePicker.launch("audio/*") }
+                    Spacer(Modifier.height(16.dp))
+                    ActionButton("Загрузить и обработать") { startUpload() }
                 }
 
-                var isPlaying by remember { mutableStateOf(false) }
-                val mediaPlayer = remember { mutableStateOf<android.media.MediaPlayer?>(null) }
+                is UiState.Uploading ->
+                    ProgressCard("Загрузка на сервер...", 0f, elapsedSec, true)
 
-                // ===== FILE AREA =====
-                if (selectedFilename.isEmpty()) {
-                    // Upload zone
-                    Card(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(148.dp)
-                            .clickable(enabled = !isProcessing && !diarizationInProgress) {
-                                filePickerLauncher.launch(arrayOf("audio/*"))
-                            },
-                        shape = RoundedCornerShape(20.dp),
-                        colors = CardDefaults.cardColors(containerColor = Color.Transparent),
-                        border = BorderStroke(1.5.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.22f))
-                    ) {
-                        Column(
-                            modifier = Modifier.fillMaxSize(),
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                            verticalArrangement = Arrangement.Center
-                        ) {
-                            Text(
-                                text = "+",
-                                fontSize = 34.sp,
-                                fontWeight = FontWeight.Light,
-                                color = MaterialTheme.colorScheme.primary.copy(alpha = 0.6f)
-                            )
-                            Spacer(Modifier.height(6.dp))
-                            Text(
-                                text = "Выбрать аудио",
-                                fontSize = 15.sp,
-                                fontWeight = FontWeight.Medium,
-                                color = MaterialTheme.colorScheme.onBackground
-                            )
-                            Spacer(Modifier.height(3.dp))
-                            Text(
-                                text = "MP3 · WAV · M4A · OGG · MP4",
-                                fontSize = 11.sp,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
-                    }
-                } else {
-                    // File card
-                    Card(
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(16.dp),
-                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.surfaceVariant)
-                    ) {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(12.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Surface(
-                                modifier = Modifier.size(42.dp),
-                                shape = RoundedCornerShape(10.dp),
-                                color = MaterialTheme.colorScheme.primary.copy(alpha = 0.10f)
-                            ) {
-                                Box(contentAlignment = Alignment.Center) {
-                                    Text("🎵", fontSize = 18.sp)
-                                }
-                            }
-                            Spacer(Modifier.width(12.dp))
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    text = selectedFilename,
-                                    fontWeight = FontWeight.Medium,
-                                    fontSize = 13.sp,
-                                    color = MaterialTheme.colorScheme.onSurface,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                                Text(
-                                    text = "нажмите ▶ для прослушивания",
-                                    fontSize = 11.sp,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            }
-                            IconButton(
-                                onClick = {
-                                    if (isPlaying) {
-                                        mediaPlayer.value?.stop()
-                                        mediaPlayer.value?.release()
-                                        mediaPlayer.value = null
-                                        isPlaying = false
-                                    } else {
-                                        val uri = selectedUri ?: return@IconButton
-                                        try {
-                                            val mp = android.media.MediaPlayer()
-                                            mp.setDataSource(context, uri)
-                                            mp.setOnCompletionListener {
-                                                mp.release(); mediaPlayer.value = null; isPlaying = false
-                                            }
-                                            mp.setOnErrorListener { _, _, _ ->
-                                                mp.release(); mediaPlayer.value = null; isPlaying = false; true
-                                            }
-                                            mp.prepare(); mp.start()
-                                            mediaPlayer.value = mp; isPlaying = true
-                                        } catch (_: Exception) {
-                                            Toast.makeText(context, "Ошибка воспроизведения", Toast.LENGTH_SHORT).show()
-                                        }
-                                    }
-                                },
-                                enabled = !isProcessing && !diarizationInProgress
-                            ) {
-                                Text(
-                                    text = if (isPlaying) "⏹" else "▶",
-                                    fontSize = 16.sp,
-                                    color = if (isPlaying) MaterialTheme.colorScheme.error
-                                            else MaterialTheme.colorScheme.secondary
-                                )
-                            }
-                            IconButton(
-                                onClick = { filePickerLauncher.launch(arrayOf("audio/*")) },
-                                enabled = !isProcessing && !diarizationInProgress
-                            ) {
-                                Text("↩", fontSize = 16.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            }
-                        }
-                    }
-
+                is UiState.Processing -> {
+                    FileCard(selectedName, 0f, compact = true, onChangeTap = null)
                     Spacer(Modifier.height(12.dp))
-
-                    // ===== ACTION BUTTON =====
-                    if (!isProcessing && !diarizationInProgress && !transcribingSegments) {
-                        Button(
-                            onClick = {
-                                diarizationInProgress = true
-                                onRunSpeakerTimeline(
-                                    selectedUri!!,
-                                    selectedFilename,
-                                    { msg -> baseProgress = msg },
-                                    { msg ->
-                                        logLines.add(msg)
-                                        fileLogger?.log(msg)
-                                    },
-                                    { timelineResult ->
-                                        speakerTimelineResult = timelineResult
-                                        result = timelineResult
-                                        showSpeakerTimelineModal = true
-                                        diarizationInProgress = false
-                                        logLines.add("[ДИАР.] ✅ ML-таймлайн готов")
-                                        fileLogger?.log("ML-таймлайн готов")
-                                    },
-                                    { timelineObj ->
-                                        timelineSegments = timelineObj.segments
-                                        timelineSpeakerCount = timelineObj.speakerCount
-                                        timelineAudioUri = selectedUri
-                                    },
-                                    { err ->
-                                        error = err
-                                        diarizationInProgress = false
-                                        logLines.add("[ДИАР.] ❌ $err")
-                                        fileLogger?.logError(err)
-                                    }
-                                )
-                            },
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(56.dp),
-                            shape = RoundedCornerShape(16.dp),
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = Color(0xFF4F46E5)
-                            )
-                        ) {
-                            Text(
-                                text = "Разделить на спикеров",
-                                fontWeight = FontWeight.SemiBold,
-                                fontSize = 15.sp
-                            )
-                        }
-                    }
+                    ProgressCard(s.step, s.progress, elapsedSec, s.progress < 0.01f)
                 }
 
-                // ===== PROCESSING CARD =====
-                if (isProcessing || diarizationInProgress || transcribingSegments) {
-                    Spacer(Modifier.height(16.dp))
-                    Card(
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(16.dp),
-                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.surfaceVariant)
-                    ) {
-                        Column(modifier = Modifier.padding(16.dp)) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text(
-                                    text = baseProgress.ifEmpty { "Обработка..." },
-                                    fontWeight = FontWeight.Medium,
-                                    fontSize = 13.sp,
-                                    color = MaterialTheme.colorScheme.onSurface,
-                                    modifier = Modifier.weight(1f),
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                                val timerStr = progress.substringAfterLast("⏱", "").trim()
-                                if (timerStr.isNotEmpty()) {
-                                    Text(
-                                        text = "⏱ $timerStr",
-                                        fontSize = 12.sp,
-                                        color = MaterialTheme.colorScheme.primary,
-                                        fontFamily = FontFamily.Monospace
-                                    )
-                                }
-                            }
-                            Spacer(Modifier.height(10.dp))
-                            LinearProgressIndicator(
-                                modifier = Modifier.fillMaxWidth(),
-                                color = MaterialTheme.colorScheme.primary,
-                                trackColor = MaterialTheme.colorScheme.surfaceVariant
-                            )
-                        }
-                    }
-                }
-
-                // ===== RESULT CARD =====
-                if (result.isNotEmpty()) {
-                    Spacer(Modifier.height(16.dp))
-                    Card(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .weight(1f, fill = false),
-                        shape = RoundedCornerShape(16.dp),
-                        colors = CardDefaults.cardColors(containerColor = Color(0xFF080F1E)),
-                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.surfaceVariant)
-                    ) {
-                        Column(modifier = Modifier.padding(16.dp)) {
-                            Text(
-                                text = result,
-                                fontSize = 13.sp,
-                                fontFamily = FontFamily.Monospace,
-                                lineHeight = 21.sp,
-                                color = Color(0xFFCDD5E0),
-                                modifier = Modifier
-                                    .weight(1f, fill = false)
-                                    .verticalScroll(rememberScrollState())
-                            )
-                            HorizontalDivider(
-                                modifier = Modifier.padding(vertical = 10.dp),
-                                color = MaterialTheme.colorScheme.surfaceVariant
-                            )
-                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                Button(
-                                    onClick = {
-                                        clipboardManager.setText(AnnotatedString(result))
-                                        Toast.makeText(context, "Скопировано!", Toast.LENGTH_SHORT).show()
-                                    },
-                                    modifier = Modifier.weight(1f).height(40.dp),
-                                    shape = RoundedCornerShape(10.dp),
-                                    colors = ButtonDefaults.buttonColors(
-                                        containerColor = MaterialTheme.colorScheme.surfaceVariant
-                                    )
-                                ) {
-                                    Text("Копировать", fontSize = 13.sp)
-                                }
-                                if (transcribedSegments.isNotEmpty()) {
-                                    Button(
-                                        onClick = { showTranscribedModal = true },
-                                        modifier = Modifier.weight(1f).height(40.dp),
-                                        shape = RoundedCornerShape(10.dp),
-                                        colors = ButtonDefaults.buttonColors(
-                                            containerColor = Color(0xFF4F46E5)
-                                        )
-                                    ) {
-                                        Text("Реплики", fontSize = 13.sp)
-                                    }
-                                }
-                            }
-                        }
+                is UiState.Done ->
+                    ResultBlock(s) {
+                        selectedUri = null
+                        selectedName = ""
+                        jobId = null
+                        startMs = 0L
+                        uiState = UiState.Idle
                     }
 
-                                        // ===== SPEAKER TIMELINE MODAL with player =====
-                    if (showSpeakerTimelineModal && speakerTimelineResult.isNotEmpty()) {
-                        AlertDialog(
-                            onDismissRequest = { showSpeakerTimelineModal = false },
-                            title = {
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.SpaceBetween,
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Text(
-                                        text = "🎙 Таймлайн спикеров",
-                                        color = MaterialTheme.colorScheme.primary,
-                                        fontWeight = FontWeight.Bold,
-                                        fontSize = 18.sp
-                                    )
-                                    IconButton(onClick = { showSpeakerTimelineModal = false }) {
-                                        Text("✕", fontSize = 20.sp, color = MaterialTheme.colorScheme.onSurface)
-                                    }
-                                }
-                            },
-                            text = {
-                                Column(modifier = Modifier.fillMaxWidth()) {
-                                    // === Player with seekbar ===
-                                    val speakerColors = remember {
-                                        listOf(
-                                            Color(0xFF58A6FF), // синий
-                                            Color(0xFFDA3633), // красный
-                                            Color(0xFF3FB950), // зелёный
-                                            Color(0xFFD29922), // жёлтый
-                                            Color(0xFFBC8CFF), // фиолетовый
-                                            Color(0xFFF0883E), // оранжевый
-                                            Color(0xFF79C0FF), // голубой
-                                            Color(0xFFF85149), // розовый
-                                        )
-                                    }
-                                    var isPlayingTimeline by remember { mutableStateOf(false) }
-                                    var currentTimeSec by remember { mutableFloatStateOf(0f) }
-                                    val timelinePlayer = remember { mutableStateOf<android.media.MediaPlayer?>(null) }
-                                    val totalSec = timelineSegments.maxOfOrNull { it.endSec } ?: 0f
-                                    
-                                    // Cleanup player when dialog closes
-                                    DisposableEffect(showSpeakerTimelineModal) {
-                                        onDispose {
-                                            timelinePlayer.value?.stop()
-                                            timelinePlayer.value?.release()
-                                            timelinePlayer.value = null
-                                        }
-                                    }
-                                    
-                                    // LaunchEffect to tick during playback
-                                    LaunchedEffect(isPlayingTimeline) {
-                                        if (isPlayingTimeline && timelinePlayer.value != null) {
-                                            while (isPlayingTimeline) {
-                                                val mp = timelinePlayer.value
-                                                if (mp != null && mp.isPlaying) {
-                                                    currentTimeSec = mp.currentPosition / 1000f
-                                                } else if (mp != null && !mp.isPlaying && currentTimeSec > 0f) {
-                                                    isPlayingTimeline = false
-                                                }
-                                                kotlinx.coroutines.delay(100)
-                                            }
-                                        }
-                                    }
-                                    
-                                    // Player controls row
-                                    Surface(
-                                        modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
-                                        color = Color(0xFF161B22),
-                                        shape = MaterialTheme.shapes.small
-                                    ) {
-                                        Column(modifier = Modifier.padding(12.dp)) {
-                                            // Play/Pause + Seekbar + Time
-                                            Row(
-                                                verticalAlignment = Alignment.CenterVertically,
-                                                modifier = Modifier.fillMaxWidth()
-                                            ) {
-                                                IconButton(
-                                                    onClick = {
-                                                        if (isPlayingTimeline) {
-                                                            timelinePlayer.value?.pause()
-                                                            isPlayingTimeline = false
-                                                        } else {
-                                                            val uri = timelineAudioUri ?: return@IconButton
-                                                            try {
-                                                                if (timelinePlayer.value == null) {
-                                                                    val mp = android.media.MediaPlayer()
-                                                                    mp.setDataSource(context, uri)
-                                                                    mp.setOnCompletionListener {
-                                                                        mp.release()
-                                                                        timelinePlayer.value = null
-                                                                        isPlayingTimeline = false
-                                                                        currentTimeSec = 0f
-                                                                    }
-                                                                    mp.setOnErrorListener { _, _, _ ->
-                                                                        mp.release()
-                                                                        timelinePlayer.value = null
-                                                                        isPlayingTimeline = false
-                                                                        true
-                                                                    }
-                                                                    mp.prepare()
-                                                                    timelinePlayer.value = mp
-                                                                }
-                                                                val mp = timelinePlayer.value
-                                                                if (mp != null && !mp.isPlaying) {
-                                                                    if (currentTimeSec >= totalSec) {
-                                                                        mp.seekTo(0)
-                                                                        currentTimeSec = 0f
-                                                                    }
-                                                                    mp.start()
-                                                                    isPlayingTimeline = true
-                                                                }
-                                                            } catch (e: Exception) {
-                                                                Toast.makeText(context, "Ошибка плеера", Toast.LENGTH_SHORT).show()
-                                                            }
-                                                        }
-                                                    },
-                                                    modifier = Modifier.size(40.dp)
-                                                ) {
-                                                    Text(
-                                                        if (isPlayingTimeline) "⏸" else "▶",
-                                                        fontSize = 20.sp
-                                                    )
-                                                }
-                                                
-                                                Slider(
-                                                    value = currentTimeSec,
-                                                    onValueChange = { 
-                                                        currentTimeSec = it
-                                                        timelinePlayer.value?.seekTo((it * 1000).toInt())
-                                                    },
-                                                    valueRange = 0f..maxOf(totalSec, 1f),
-                                                    modifier = Modifier.weight(1f).height(32.dp),
-                                                    colors = SliderDefaults.colors(
-                                                        thumbColor = MaterialTheme.colorScheme.primary,
-                                                        activeTrackColor = MaterialTheme.colorScheme.primary,
-                                                        inactiveTrackColor = Color(0xFF30363D)
-                                                    )
-                                                )
-                                                
-                                                Text(
-                                                    text = "${formatTime(currentTimeSec)} / ${formatTime(totalSec)}",
-                                                    fontSize = 11.sp,
-                                                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
-                                                    modifier = Modifier.padding(start = 4.dp).width(80.dp)
-                                                )
-                                            }
-                                            
-                                            // Current speaker display
-                                            if (timelineSegments.isNotEmpty()) {
-                                                Spacer(Modifier.height(8.dp))
-                                                val currentSpeaker = timelineSegments.find { seg ->
-                                                    currentTimeSec >= seg.startSec && currentTimeSec < seg.endSec
-                                                }
-                                                if (currentSpeaker != null) {
-                                                    val col = speakerColors[currentSpeaker.speakerId % speakerColors.size]
-                                                    Text(
-                                                        text = "▶ Сейчас говорит Спикер ${currentSpeaker.speakerId + 1}   [${
-                                                            formatTime(currentSpeaker.startSec)} — ${formatTime(currentSpeaker.endSec)}]",
-                                                        fontSize = 14.sp,
-                                                        color = col,
-                                                        fontWeight = FontWeight.Bold
-                                                    )
-                                                } else if (currentTimeSec > 0f) {
-                                                    Text(
-                                                        text = "⏸ Пауза",
-                                                        fontSize = 14.sp,
-                                                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f)
-                                                    )
-                                                }
-                                            }
-                                        }
-                                    }
-                                    
-Spacer(Modifier.height(8.dp))
-
-                                    // ===== TRANSCRIBE SEGMENTS BUTTON =====
-                                    Button(
-                                        onClick = {
-                                            showSpeakerTimelineModal = false
-                                            transcribingSegments = true
-                                            onTranscribeDiarizationSegments(
-                                                timelineSegments,
-                                                timelineAudioUri,
-                                                { msg -> baseProgress = msg },
-                                                { msg ->
-                                                    logLines.add(msg)
-                                                    fileLogger?.log(msg)
-                                                },
-                                                { segments ->
-                                                    transcribedSegments = segments
-                                                    transcribingSegments = false
-                                                    showTranscribedModal = true
-                                                    // Build dialogue text for main screen result
-                                                    result = segments.filter { it.text.isNotEmpty() }.joinToString("\n\n") { seg ->
-                                                        val name = "Спикер ${seg.speakerId + 1}"
-                                                        "$name: ${seg.text}"
-                                                    }
-                                                    logLines.add("[ТРАНСКР.] ✅ Транскрибация сегментов завершена (${segments.size} сегментов)")
-                                                    fileLogger?.log("Транскрибация сегментов завершена")
-                                                },
-                                                { err ->
-                                                    error = err
-                                                    transcribingSegments = false
-                                                    logLines.add("[ТРАНСКР.] ❌ $err")
-                                                    fileLogger?.logError(err)
-                                                }
-                                            )
-                                        },
-                                        modifier = Modifier.fillMaxWidth().height(48.dp),
-                                        colors = ButtonDefaults.buttonColors(
-                                            containerColor = Color(0xFF2EA043)
-                                        )
-                                    ) {
-                                        Text("Далее (тр. по репликам)", fontSize = 15.sp, fontWeight = FontWeight.Bold, color = Color.White)
-                                    }
-                                    Spacer(Modifier.height(8.dp))
-
-                                    Button(
-                                        onClick = {
-                                            clipboardManager.setText(AnnotatedString(speakerTimelineResult))
-                                            Toast.makeText(context, "Таймлайн скопирован!", Toast.LENGTH_SHORT).show()
-                                        },
-                                        modifier = Modifier.fillMaxWidth()
-                                    ) {
-                                        Text("📋 Копировать таймлайн")
-                                    }
-                                    Spacer(Modifier.height(8.dp))
-
-                                    Surface(
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .height(300.dp)
-                                            .verticalScroll(rememberScrollState())
-                                            .clickable {
-                                                clipboardManager.setText(AnnotatedString(speakerTimelineResult))
-                                                Toast.makeText(context, "Скопировано!", Toast.LENGTH_SHORT).show()
-                                            },
-                                        color = Color(0xFF0D1117),
-                                        shape = MaterialTheme.shapes.small
-                                    ) {
-                                        Text(
-                                            text = speakerTimelineResult,
-                                            modifier = Modifier.padding(12.dp),
-                                            fontSize = 13.sp,
-                                            fontFamily = FontFamily.Monospace,
-                                            lineHeight = 20.sp,
-                                            color = Color(0xFF58A6FF),
-                                            softWrap = true
-                                        )
-                                    }
-                                    Spacer(Modifier.height(4.dp))
-                                    Text(
-                                        text = "👆 Нажмите на текст, чтобы скопировать",
-                                        fontSize = 10.sp,
-                                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.4f)
-                                    )
-                                }
-                            },
-                            confirmButton = {
-                                TextButton(onClick = { showSpeakerTimelineModal = false }) {
-                                    Text("✕ Закрыть", fontSize = 14.sp)
-                                }
-                            },
-                            containerColor = MaterialTheme.colorScheme.background
-                        )
+                is UiState.Error ->
+                    ErrorCard(s.message) {
+                        uiState = if (selectedUri != null) {
+                            val sz = context.contentResolver.openFileDescriptor(selectedUri!!, "r")
+                                ?.use { it.statSize / 1_048_576f } ?: 0f
+                            UiState.FileSelected(selectedName, sz)
+                        } else UiState.Idle
                     }
-                    // ===== TRANSCRIBED SEGMENTS MODAL =====
-                    if (showTranscribedModal && transcribedSegments.isNotEmpty()) {
-                        val speakerColors = remember {
-                            listOf(
-                                Color(0xFF58A6FF), Color(0xFFDA3633), Color(0xFF3FB950),
-                                Color(0xFFD29922), Color(0xFFBC8CFF), Color(0xFFF0883E),
-                                Color(0xFF79C0FF), Color(0xFFF85149),
-                            )
-                        }
-                        var currentPlayingIdx by remember { mutableIntStateOf(-1) }
-                        val segPlayers = remember { mutableStateMapOf<Int, android.media.MediaPlayer>() }
-
-                        DisposableEffect(showTranscribedModal) {
-                            onDispose {
-                                segPlayers.values.forEach { it.release() }
-                                segPlayers.clear()
-                            }
-                        }
-
-                        AlertDialog(
-                            onDismissRequest = {
-                                segPlayers.values.forEach { it.stop(); it.release() }
-                                segPlayers.clear()
-                                showTranscribedModal = false
-                            },
-                            title = {
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.SpaceBetween,
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Text(
-                                        text = "📝 Реплики по спикерам",
-                                        color = MaterialTheme.colorScheme.primary,
-                                        fontWeight = FontWeight.Bold,
-                                        fontSize = 18.sp
-                                    )
-                                    IconButton(onClick = {
-                                        segPlayers.values.forEach { it.stop(); it.release() }
-                                        segPlayers.clear()
-                                        showTranscribedModal = false
-                                    }) {
-                                        Text("✕", fontSize = 20.sp, color = MaterialTheme.colorScheme.onSurface)
-                                    }
-                                }
-                            },
-                            text = {
-                                Column(modifier = Modifier.fillMaxWidth()) {
-                                    // Tab toggle
-                                    var showAudioTab by remember { mutableStateOf(true) }
-                                    val speakerColorsLocal = speakerColors
-
-                                    Surface(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        shape = MaterialTheme.shapes.small,
-                                        color = MaterialTheme.colorScheme.surfaceVariant
-                                    ) {
-                                        Row(
-                                            modifier = Modifier.fillMaxWidth(),
-                                            horizontalArrangement = Arrangement.Center
-                                        ) {
-                                            TextButton(
-                                                onClick = { showAudioTab = true },
-                                                modifier = Modifier.weight(1f),
-                                                colors = ButtonDefaults.textButtonColors(
-                                                    containerColor = if (showAudioTab)
-                                                        MaterialTheme.colorScheme.primary.copy(alpha = 0.15f)
-                                                    else Color.Transparent
-                                                )
-                                            ) {
-                                                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                                    Text("🎵", fontSize = 16.sp)
-                                                    Text(
-                                                        "Аудио реплики",
-                                                        fontWeight = if (showAudioTab) FontWeight.Bold else FontWeight.Normal,
-                                                        fontSize = 11.sp
-                                                    )
-                                                }
-                                            }
-                                            TextButton(
-                                                onClick = { showAudioTab = false },
-                                                modifier = Modifier.weight(1f),
-                                                colors = ButtonDefaults.textButtonColors(
-                                                    containerColor = if (!showAudioTab)
-                                                        MaterialTheme.colorScheme.tertiary.copy(alpha = 0.15f)
-                                                    else Color.Transparent
-                                                )
-                                            ) {
-                                                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                                    Text("💬", fontSize = 16.sp)
-                                                    Text(
-                                                        "Весь диалог",
-                                                        fontWeight = if (!showAudioTab) FontWeight.Bold else FontWeight.Normal,
-                                                        fontSize = 11.sp
-                                                    )
-                                                }
-                                            }
-                                        }
-                                    }
-                                    Spacer(Modifier.height(6.dp))
-
-                                    // ===== SPEAKER CONFIG CHIP (state in MainScreen level) =====
-                                    Row(modifier = Modifier.fillMaxWidth()) {
-                                        AssistChip(
-                                            onClick = {
-                                                editConfigs = speakerConfigs.map { it.copy() }
-                                                showSpeakerConfigDialog = true
-                                            },
-                                            label = { Text("Спикеры", fontSize = 12.sp) },
-                                            leadingIcon = {
-                                                Text("👥", fontSize = 14.sp)
-                                            },
-                                            colors = AssistChipDefaults.assistChipColors(
-                                                containerColor = MaterialTheme.colorScheme.surfaceVariant
-                                            )
-                                        )
-                                    }
-                                    Spacer(Modifier.height(4.dp))
-
-                                    if (showAudioTab) {
-                                        Column(
-                                            modifier = Modifier
-                                                .fillMaxWidth()
-                                                .heightIn(max = 420.dp)
-                                                .verticalScroll(rememberScrollState())
-                                        ) {
-                                            transcribedSegments.forEachIndexed { i, seg ->
-                                                val cfg = speakerConfigs.find { it.id == seg.speakerId }
-                                                val effectiveSpkId = cfg?.mergedInto ?: seg.speakerId
-                                                val effectiveCfg = speakerConfigs.find { it.id == effectiveSpkId }
-                                                val displayName = effectiveCfg?.name?.takeIf { it.isNotBlank() } ?: "Спикер ${effectiveSpkId + 1}"
-                                                val labelColor = speakerColorsLocal[effectiveSpkId % speakerColorsLocal.size]
-                                                val isThisPlaying = currentPlayingIdx == i
-
-                                                Card(
-                                                    modifier = Modifier
-                                                        .fillMaxWidth()
-                                                        .padding(vertical = 4.dp),
-                                                    colors = CardDefaults.cardColors(
-                                                        containerColor = Color(0xFF161B22)
-                                                    )
-                                                ) {
-                                                    Column(modifier = Modifier.padding(10.dp)) {
-                                                        Row(
-                                                            modifier = Modifier.fillMaxWidth(),
-                                                            verticalAlignment = Alignment.CenterVertically,
-                                                            horizontalArrangement = Arrangement.SpaceBetween
-                                                        ) {
-                                                            Column(modifier = Modifier.weight(1f)) {
-                                                                Text(
-                                                                    text = displayName,
-                                                                    color = labelColor,
-                                                                    fontWeight = FontWeight.Bold,
-                                                                    fontSize = 14.sp,
-                                                                    modifier = Modifier.clickable {
-                                                                        miniConfigSpeakerId = seg.speakerId
-                                                                        editConfigs = speakerConfigs.map { SpeakerConfig(it.id, it.name, it.mergedInto) }
-                                                                    }
-                                                                )
-                                                                Text(
-                                                                    text = "${formatTime(seg.startSec)} — ${formatTime(seg.endSec)}",
-                                                                    fontSize = 11.sp,
-                                                                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f)
-                                                                )
-                                                            }
-                                                            IconButton(
-                                                                onClick = {
-                                                                    if (isThisPlaying) {
-                                                                        segPlayers[i]?.pause()
-                                                                        currentPlayingIdx = -1
-                                                                    } else {
-                                                                        segPlayers.values.forEach { it.stop(); it.release() }
-                                                                        segPlayers.clear()
-                                                                        if (seg.audioFile.isNotEmpty() && java.io.File(seg.audioFile).exists()) {
-                                                                            try {
-                                                                                val mp = android.media.MediaPlayer()
-                                                                                mp.setDataSource(seg.audioFile)
-                                                                                mp.setOnCompletionListener {
-                                                                                    mp.release()
-                                                                                    segPlayers.remove(i)
-                                                                                    currentPlayingIdx = -1
-                                                                                }
-                                                                                mp.setOnErrorListener { _, _, _ ->
-                                                                                    mp.release()
-                                                                                    segPlayers.remove(i)
-                                                                                    currentPlayingIdx = -1
-                                                                                    true
-                                                                                }
-                                                                                mp.prepare()
-                                                                                mp.start()
-                                                                                segPlayers[i] = mp
-                                                                                currentPlayingIdx = i
-                                                                            } catch (_: Exception) {}
-                                                                        }
-                                                                    }
-                                                                },
-                                                                modifier = Modifier.size(36.dp)
-                                                            ) {
-                                                                Text(
-                                                                    if (isThisPlaying) "⏸" else "▶",
-                                                                    fontSize = 18.sp
-                                                                )
-                                                            }
-                                                        }
-                                                        if (seg.text.isNotEmpty()) {
-                                                            Spacer(Modifier.height(6.dp))
-                                                            Surface(
-                                                                modifier = Modifier.clickable {
-                                                                    clipboardManager.setText(AnnotatedString(seg.text))
-                                                                    Toast.makeText(context, "Текст скопирован!", Toast.LENGTH_SHORT).show()
-                                                                },
-                                                                color = Color(0xFF0D1117),
-                                                                shape = MaterialTheme.shapes.small
-                                                            ) {
-                                                                Text(
-                                                                    text = seg.text,
-                                                                    modifier = Modifier.padding(8.dp),
-                                                                    fontSize = 13.sp,
-                                                                    fontFamily = FontFamily.Monospace,
-                                                                    lineHeight = 20.sp,
-                                                                    color = Color(0xFFE0E0E0),
-                                                                    softWrap = true
-                                                                )
-                                                            }
-                                                        } else if (seg.audioFile.isEmpty()) {
-                                                            Spacer(Modifier.height(6.dp))
-                                                            Text(
-                                                                text = "⏭ Сегмент слишком короткий для распознавания",
-                                                                fontSize = 11.sp,
-                                                                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.4f)
-                                                            )
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    } else {
-                                        // ===== DIALOGUE TAB WITH PLAYER =====
-                                        var isPlayingDialogue by remember { mutableStateOf(false) }
-                                        var currentPosSec by remember { mutableFloatStateOf(0f) }
-                                        var is2x by remember { mutableStateOf(false) }
-                                        val dialoguePlayer = remember { mutableStateOf<android.media.MediaPlayer?>(null) }
-                                        val totalAudioSec = timelineSegments.maxOfOrNull { it.endSec } ?: 0f
-
-                                        DisposableEffect(showTranscribedModal) {
-                                            onDispose {
-                                                dialoguePlayer.value?.stop()
-                                                dialoguePlayer.value?.release()
-                                                dialoguePlayer.value = null
-                                            }
-                                        }
-
-                                        LaunchedEffect(isPlayingDialogue) {
-                                            if (isPlayingDialogue && dialoguePlayer.value != null) {
-                                                while (isPlayingDialogue) {
-                                                    val mp = dialoguePlayer.value
-                                                    if (mp != null && mp.isPlaying) {
-                                                        currentPosSec = mp.currentPosition / 1000f
-                                                    } else if (mp != null && !mp.isPlaying && currentPosSec > 0f) {
-                                                        isPlayingDialogue = false
-                                                    }
-                                                    kotlinx.coroutines.delay(100)
-                                                }
-                                            }
-                                        }
-
-                                        Column {
-                                            // Player controls
-                                            Surface(
-                                                modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp),
-                                                color = Color(0xFF161B22),
-                                                shape = MaterialTheme.shapes.small
-                                            ) {
-                                                Column(modifier = Modifier.padding(8.dp)) {
-                                                    Row(
-                                                        verticalAlignment = Alignment.CenterVertically,
-                                                        modifier = Modifier.fillMaxWidth()
-                                                    ) {
-                                                        IconButton(
-                                                            onClick = {
-                                                                if (isPlayingDialogue) {
-                                                                    dialoguePlayer.value?.pause()
-                                                                    isPlayingDialogue = false
-                                                                } else {
-                                                                    val uri = timelineAudioUri ?: return@IconButton
-                                                                    try {
-                                                                        if (dialoguePlayer.value == null) {
-                                                                            val mp = android.media.MediaPlayer()
-                                                                            mp.setDataSource(context, uri)
-                                                                            mp.setOnCompletionListener {
-                                                                                mp.release()
-                                                                                dialoguePlayer.value = null
-                                                                                isPlayingDialogue = false
-                                                                                currentPosSec = 0f
-                                                                            }
-                                                                            mp.setOnErrorListener { _, _, _ ->
-                                                                                mp.release()
-                                                                                dialoguePlayer.value = null
-                                                                                isPlayingDialogue = false
-                                                                                true
-                                                                            }
-                                                                            mp.prepare()
-                                                                            if (is2x) {
-                                                                                val params = mp.playbackParams
-                                                                                params.speed = 2.0f
-                                                                                mp.playbackParams = params
-                                                                            }
-                                                                            dialoguePlayer.value = mp
-                                                                        }
-                                                                        val mp = dialoguePlayer.value
-                                                                        if (mp != null && !mp.isPlaying) {
-                                                                            mp.start()
-                                                                            isPlayingDialogue = true
-                                                                        }
-                                                                    } catch (_: Exception) {}
-                                                                }
-                                                            },
-                                                            modifier = Modifier.size(32.dp)
-                                                        ) {
-                                                            Text(if (isPlayingDialogue) "⏸" else "▶", fontSize = 16.sp)
-                                                        }
-                                                        Slider(
-                                                            value = currentPosSec,
-                                                            onValueChange = {
-                                                                currentPosSec = it
-                                                                dialoguePlayer.value?.seekTo((it * 1000).toInt())
-                                                            },
-                                                            valueRange = 0f..maxOf(totalAudioSec, 1f),
-                                                            modifier = Modifier.weight(1f).height(28.dp),
-                                                            colors = SliderDefaults.colors(
-                                                                thumbColor = MaterialTheme.colorScheme.primary,
-                                                                activeTrackColor = MaterialTheme.colorScheme.primary,
-                                                                inactiveTrackColor = Color(0xFF30363D)
-                                                            )
-                                                        )
-                                                        Text(
-                                                            text = formatTime(currentPosSec),
-                                                            fontSize = 11.sp,
-                                                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
-                                                            modifier = Modifier.padding(horizontal = 4.dp).width(36.dp)
-                                                        )
-                                                        // 2x speed toggle
-                                                        Surface(
-                                                            modifier = Modifier.size(28.dp).clickable {
-                                                                is2x = !is2x
-                                                                dialoguePlayer.value?.let { mp ->
-                                                                    if (mp.isPlaying) {
-                                                                        val params = mp.playbackParams
-                                                                        params.speed = if (is2x) 2.0f else 1.0f
-                                                                        mp.playbackParams = params
-                                                                    }
-                                                                }
-                                                            },
-                                                            shape = MaterialTheme.shapes.small,
-                                                            color = if (is2x) MaterialTheme.colorScheme.primary.copy(alpha = 0.3f) else Color(0xFF30363D)
-                                                        ) {
-                                                            Text(
-                                                                text = "x2",
-                                                                fontSize = 10.sp,
-                                                                fontWeight = FontWeight.Bold,
-                                                                color = if (is2x) MaterialTheme.colorScheme.primary else Color.White,
-                                                                modifier = Modifier.padding(3.dp)
-                                                            )
-                                                        }
-                                                    }
-                                                    // Current speaker
-                                                    val currentSpeaker = timelineSegments.find {
-                                                        currentPosSec >= it.startSec && currentPosSec < it.endSec
-                                                    }
-                                                    if (currentSpeaker != null) {
-                                                        val col = speakerColorsLocal[currentSpeaker.speakerId % speakerColorsLocal.size]
-                                                        val cfg = speakerConfigs.find { c -> c.id == currentSpeaker.speakerId }
-                                                        val effId = cfg?.mergedInto ?: currentSpeaker.speakerId
-                                                        val effCfg = speakerConfigs.find { c -> c.id == effId }
-                                                        val name = effCfg?.name?.takeIf { it.isNotBlank() } ?: "Спикер ${effId + 1}"
-                                                        Text(
-                                                            text = "▶ $name   [${formatTime(currentSpeaker.startSec)} — ${formatTime(currentSpeaker.endSec)}]",
-                                                            fontSize = 11.sp,
-                                                            color = col,
-                                                            fontWeight = FontWeight.Bold
-                                                        )
-                                                    }
-                                                }
-                                            }
-
-                                            // Dialogue text
-                                            Surface(
-                                                modifier = Modifier
-                                                    .fillMaxWidth()
-                                                    .heightIn(max = 370.dp)
-                                                    .verticalScroll(rememberScrollState())
-                                                    .clickable {
-                                                        clipboardManager.setText(AnnotatedString(dialogueText))
-                                                        Toast.makeText(context, "Диалог скопирован!", Toast.LENGTH_SHORT).show()
-                                                    },
-                                                color = Color(0xFF0D1117),
-                                                shape = MaterialTheme.shapes.small
-                                            ) {
-                                                Text(
-                                                    text = dialogueText,
-                                                    modifier = Modifier.padding(12.dp),
-                                                    fontSize = 14.sp,
-                                                    fontFamily = FontFamily.Monospace,
-                                                    lineHeight = 22.sp,
-                                                    color = Color(0xFFE0E0E0),
-                                                    softWrap = true
-                                                )
-                                            }
-                                            Spacer(Modifier.height(4.dp))
-                                            Text(
-                                                text = "👆 Нажмите на текст, чтобы скопировать диалог",
-                                                fontSize = 10.sp,
-                                                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.4f)
-                                            )
-                                        }
-                                    }
-
-                                    // ===== SPEAKER CONFIG DIALOG =====
-                                    if (showSpeakerConfigDialog) {
-                                        AlertDialog(
-                                            onDismissRequest = {
-                                                showSpeakerConfigDialog = false
-                                            },
-                                            title = {
-                                                Row(
-                                                    modifier = Modifier.fillMaxWidth(),
-                                                    horizontalArrangement = Arrangement.SpaceBetween,
-                                                    verticalAlignment = Alignment.CenterVertically
-                                                ) {
-                                                    Text(
-                                                        text = "👥 Настройка спикеров",
-                                                        color = MaterialTheme.colorScheme.primary,
-                                                        fontWeight = FontWeight.Bold,
-                                                        fontSize = 18.sp
-                                                    )
-                                                    IconButton(onClick = { showSpeakerConfigDialog = false }) {
-                                                        Text("✕", fontSize = 20.sp, color = MaterialTheme.colorScheme.onSurface)
-                                                    }
-                                                }
-                                            },
-                                            text = {
-                                                Column(
-                                                    modifier = Modifier
-                                                        .fillMaxWidth()
-                                                        .heightIn(max = 400.dp)
-                                                        .verticalScroll(rememberScrollState())
-                                                ) {
-                                                    Text(
-                                                        text = "Настройки действуют только на текущую сессию.",
-                                                        fontSize = 11.sp,
-                                                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f),
-                                                        modifier = Modifier.padding(bottom = 8.dp)
-                                                    )
-                                                    editConfigs.forEachIndexed { idx, cfg ->
-                                                        val col = speakerColorsLocal[cfg.id % speakerColorsLocal.size]
-                                                        val otherConfigs = editConfigs.filter { it.id != cfg.id }
-
-                                                        Card(
-                                                            modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
-                                                            colors = CardDefaults.cardColors(
-                                                                containerColor = Color(0xFF161B22)
-                                                            )
-                                                        ) {
-                                                            Column(modifier = Modifier.padding(10.dp)) {
-                                                                Row(
-                                                                    verticalAlignment = Alignment.CenterVertically
-                                                                ) {
-                                                                    Text(
-                                                                        text = "Спикер ${cfg.id + 1}",
-                                                                        color = col,
-                                                                        fontWeight = FontWeight.Bold,
-                                                                        fontSize = 13.sp,
-                                                                        modifier = Modifier.width(72.dp)
-                                                                    )
-                                                                    OutlinedTextField(
-                                                                        value = cfg.name,
-                                                                        onValueChange = { newName ->
-                                                                            editConfigs = editConfigs.toMutableList().also {
-                                                                                it[idx] = cfg.copy(name = newName)
-                                                                            }
-                                                                        },
-                                                                        modifier = Modifier.weight(1f).height(48.dp),
-                                                                        singleLine = true,
-                                                                        placeholder = { Text("Новое имя...", fontSize = 12.sp) },
-                                                                        textStyle = LocalTextStyle.current.copy(fontSize = 12.sp),
-                                                                        colors = OutlinedTextFieldDefaults.colors(
-                                                                            focusedBorderColor = col,
-                                                                            unfocusedBorderColor = Color(0xFF30363D)
-                                                                        )
-                                                                    )
-                                                                }
-                                                                if (otherConfigs.isNotEmpty()) {
-                                                                    Spacer(Modifier.height(4.dp))
-                                                                    Row(verticalAlignment = Alignment.CenterVertically) {
-                                                                        Text(
-                                                                            text = "Дубль:",
-                                                                            fontSize = 11.sp,
-                                                                            color = MaterialTheme.colorScheme.onSurface.copy(0.4f),
-                                                                            modifier = Modifier.width(72.dp)
-                                                                        )
-                                                                        var expanded by remember { mutableStateOf(false) }
-                                                                        val selectedMerge = cfg.mergedInto
-                                                                        val mergeLabel = if (selectedMerge != null) {
-                                                                            val otherCfg = otherConfigs.find { it.id == selectedMerge }
-                                                                            otherCfg?.name?.takeIf { it.isNotBlank() } ?: "Спикер ${selectedMerge + 1}"
-                                                                        } else "— не выбран —"
-
-                                                                        Box(modifier = Modifier.weight(1f)) {
-                                                                            OutlinedTextField(
-                                                                                value = mergeLabel,
-                                                                                onValueChange = {},
-                                                                                modifier = Modifier.fillMaxWidth().height(40.dp),
-                                                                                singleLine = true,
-                                                                                readOnly = true,
-                                                                                enabled = true,
-                                                                                textStyle = LocalTextStyle.current.copy(fontSize = 11.sp),
-                                                                                trailingIcon = {
-                                                                                    IconButton(onClick = { expanded = true },
-                                                                                        Modifier.size(20.dp)) {
-                                                                                        Text("▾", fontSize = 12.sp)
-                                                                                    }
-                                                                                },
-                                                                                colors = OutlinedTextFieldDefaults.colors(
-                                                                                    unfocusedBorderColor = Color(0xFF30363D)
-                                                                                )
-                                                                            )
-                                                                            DropdownMenu(
-                                                                                expanded = expanded,
-                                                                                onDismissRequest = { expanded = false }
-                                                                            ) {
-                                                                                DropdownMenuItem(
-                                                                                    text = { Text("— не выбран —", fontSize = 11.sp) },
-                                                                                    onClick = {
-                                                                                        editConfigs = editConfigs.toMutableList().also {
-                                                                                            it[idx] = cfg.copy(mergedInto = null)
-                                                                                        }
-                                                                                        expanded = false
-                                                                                    }
-                                                                                )
-                                                                                otherConfigs.forEach { other ->
-                                                                                    val otherName = other.name.takeIf { it.isNotBlank() } ?: "Спикер ${other.id + 1}"
-                                                                                    DropdownMenuItem(
-                                                                                        text = { Text(otherName, fontSize = 11.sp) },
-                                                                                        onClick = {
-                                                                                            editConfigs = editConfigs.toMutableList().also {
-                                                                                                it[idx] = cfg.copy(mergedInto = other.id)
-                                                                                            }
-                                                                                            expanded = false
-                                                                                        }
-                                                                                    )
-                                                                                }
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            },
-                                            confirmButton = {
-                                                TextButton(onClick = {
-                                                    speakerConfigs = editConfigs
-                                                    showSpeakerConfigDialog = false
-                                                }) {
-                                                    Text("💾 Сохранить", fontSize = 14.sp)
-                                                }
-                                            },
-                                            dismissButton = {
-                                                TextButton(onClick = {
-                                                    showSpeakerConfigDialog = false
-                                                }) {
-                                                    Text("Отмена", fontSize = 14.sp)
-                                                }
-                                            },
-                                            containerColor = MaterialTheme.colorScheme.background
-                                        )
-                                    }
-
-                                    // ===== MINI SPEAKER CONFIG DIALOG =====
-                                    if (miniConfigSpeakerId >= 0) {
-                                        val miniCfg = editConfigs.find { it.id == miniConfigSpeakerId }
-                                        val miniIdx = editConfigs.indexOfFirst { it.id == miniConfigSpeakerId }
-                                        val miniOtherConfigs = editConfigs.filter { it.id != miniConfigSpeakerId }
-                                        val colMini = speakerColorsLocal[(miniConfigSpeakerId) % speakerColorsLocal.size]
-
-                                        AlertDialog(
-                                            onDismissRequest = { miniConfigSpeakerId = -1 },
-                                            title = {
-                                                Text(
-                                                    text = "👤 Спикер ${miniConfigSpeakerId + 1}",
-                                                    color = colMini,
-                                                    fontWeight = FontWeight.Bold,
-                                                    fontSize = 18.sp
-                                                )
-                                            },
-                                            text = {
-                                                if (miniCfg != null && miniIdx >= 0) {
-                                                    Column(modifier = Modifier.fillMaxWidth()) {
-                                                        Row(verticalAlignment = Alignment.CenterVertically) {
-                                                            Text(
-                                                                text = "Имя:",
-                                                                fontSize = 13.sp,
-                                                                color = MaterialTheme.colorScheme.onSurface,
-                                                                modifier = Modifier.width(50.dp)
-                                                            )
-                                                            OutlinedTextField(
-                                                                value = miniCfg.name,
-                                                                onValueChange = { newName ->
-                                                                    editConfigs = editConfigs.toMutableList().also {
-                                                                        it[miniIdx] = miniCfg.copy(name = newName)
-                                                                    }
-                                                                },
-                                                                modifier = Modifier.weight(1f).height(48.dp),
-                                                                singleLine = true,
-                                                                placeholder = { Text("Новое имя...", fontSize = 12.sp) },
-                                                                textStyle = LocalTextStyle.current.copy(fontSize = 12.sp),
-                                                                colors = OutlinedTextFieldDefaults.colors(
-                                                                    focusedBorderColor = colMini,
-                                                                    unfocusedBorderColor = Color(0xFF30363D)
-                                                                )
-                                                            )
-                                                        }
-                                                        Spacer(Modifier.height(8.dp))
-                                                        if (miniOtherConfigs.isNotEmpty()) {
-                                                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                                                Text(
-                                                                    text = "Дубль:",
-                                                                    fontSize = 13.sp,
-                                                                    color = MaterialTheme.colorScheme.onSurface,
-                                                                    modifier = Modifier.width(50.dp)
-                                                                )
-                                                                var miniExpanded by remember { mutableStateOf(false) }
-                                                                val selectedMerge = miniCfg.mergedInto
-                                                                val miniMergeLabel = if (selectedMerge != null) {
-                                                                    val otherCfg = miniOtherConfigs.find { it.id == selectedMerge }
-                                                                    otherCfg?.name?.takeIf { it.isNotBlank() } ?: "Спикер ${selectedMerge + 1}"
-                                                                } else "— не выбран —"
-
-                                                                Box(modifier = Modifier.weight(1f)) {
-                                                                    OutlinedTextField(
-                                                                        value = miniMergeLabel,
-                                                                        onValueChange = {},
-                                                                        modifier = Modifier.fillMaxWidth().height(40.dp),
-                                                                        singleLine = true,
-                                                                        readOnly = true,
-                                                                        textStyle = LocalTextStyle.current.copy(fontSize = 11.sp),
-                                                                        trailingIcon = {
-                                                                            IconButton(onClick = { miniExpanded = true },
-                                                                                Modifier.size(20.dp)) {
-                                                                                Text("▾", fontSize = 12.sp)
-                                                                            }
-                                                                        },
-                                                                        colors = OutlinedTextFieldDefaults.colors(
-                                                                            unfocusedBorderColor = Color(0xFF30363D)
-                                                                        )
-                                                                    )
-                                                                    DropdownMenu(
-                                                                        expanded = miniExpanded,
-                                                                        onDismissRequest = { miniExpanded = false }
-                                                                    ) {
-                                                                        DropdownMenuItem(
-                                                                            text = { Text("— не выбран —", fontSize = 11.sp) },
-                                                                            onClick = {
-                                                                                editConfigs = editConfigs.toMutableList().also {
-                                                                                    it[miniIdx] = miniCfg.copy(mergedInto = null)
-                                                                                }
-                                                                                miniExpanded = false
-                                                                            }
-                                                                        )
-                                                                        miniOtherConfigs.forEach { other ->
-                                                                            val otherName = other.name.takeIf { it.isNotBlank() } ?: "Спикер ${other.id + 1}"
-                                                                            DropdownMenuItem(
-                                                                                text = { Text(otherName, fontSize = 11.sp) },
-                                                                                onClick = {
-                                                                                    editConfigs = editConfigs.toMutableList().also {
-                                                                                        it[miniIdx] = miniCfg.copy(mergedInto = other.id)
-                                                                                    }
-                                                                                    miniExpanded = false
-                                                                                }
-                                                                            )
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                        } else {
-                                                            Text(
-                                                                text = "Нет других спикеров для объединения.",
-                                                                fontSize = 11.sp,
-                                                                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.4f)
-                                                            )
-                                                        }
-                                                    }
-                                                }
-                                            },
-                                            confirmButton = {
-                                                TextButton(onClick = {
-                                                    speakerConfigs = editConfigs
-                                                    miniConfigSpeakerId = -1
-                                                }) {
-                                                    Text("💾 Сохранить", fontSize = 14.sp)
-                                                }
-                                            },
-                                            dismissButton = {
-                                                TextButton(onClick = {
-                                                    miniConfigSpeakerId = -1
-                                                }) {
-                                                    Text("Отмена", fontSize = 14.sp)
-                                                }
-                                            },
-                                            containerColor = MaterialTheme.colorScheme.background
-                                        )
-                                    }
-                                }
-                            },
-                            confirmButton = {
-                                TextButton(onClick = {
-                                    segPlayers.values.forEach { it.stop(); it.release() }
-                                    segPlayers.clear()
-                                    showTranscribedModal = false
-                                }) {
-                                    Text("✕ Закрыть", fontSize = 14.sp)
-                                }
-                            },
-                            containerColor = MaterialTheme.colorScheme.background
-                        )
-                    }
-                }
             }
 
-            if (initError.isNotEmpty()) {
-                Text(
-                    text = initError,
-                    color = MaterialTheme.colorScheme.error,
-                    fontSize = 13.sp,
-                    modifier = Modifier.padding(vertical = 8.dp)
-                )
+            Spacer(Modifier.height(40.dp))
+        }
+    }
+}
+
+// ─── Cards ────────────────────────────────────────────────────────────────────
+
+@Composable
+private fun PickerCard(onClick: () -> Unit) {
+    Card(
+        modifier = Modifier.fillMaxWidth().height(140.dp).clickable(onClick = onClick),
+        colors = CardDefaults.cardColors(containerColor = Surface),
+        shape = RoundedCornerShape(16.dp),
+        border = BorderStroke(1.5.dp, SurfaceVar),
+    ) {
+        Column(Modifier.fillMaxSize(),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center) {
+            Text("+", fontSize = 32.sp, color = OnSurfaceVar)
+            Spacer(Modifier.height(6.dp))
+            Text("Выбрать аудиофайл", fontSize = 14.sp, color = OnSurfaceVar)
+            Text("MP3  M4A  WAV  OGG", fontSize = 11.sp, color = OnSurfaceVar.copy(alpha = 0.5f))
+        }
+    }
+}
+
+@Composable
+private fun FileCard(
+    name: String,
+    sizeMb: Float,
+    compact: Boolean = false,
+    onChangeTap: (() -> Unit)?,
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = Surface),
+        shape = RoundedCornerShape(14.dp),
+        border = BorderStroke(1.dp, SurfaceVar),
+    ) {
+        Row(Modifier.padding(horizontal = 16.dp, vertical = if (compact) 10.dp else 14.dp),
+            verticalAlignment = Alignment.CenterVertically) {
+            Text("🎵", fontSize = 20.sp)
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text(name, fontSize = 13.sp, color = OnSurface, fontWeight = FontWeight.Medium,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis)
+                if (sizeMb > 0)
+                    Text("%.1f МБ".format(sizeMb), fontSize = 11.sp, color = OnSurfaceVar)
+            }
+            if (onChangeTap != null) {
+                TextButton(onClick = onChangeTap) {
+                    Text("↩", fontSize = 16.sp, color = OnSurfaceVar)
+                }
             }
         }
     }
 }
 
-private fun formatTime(seconds: Float): String {
-    val totalSecs = seconds.toInt()
-    val mins = totalSecs / 60
-    val secs = totalSecs % 60
-    return "%d:%02d".format(mins, secs)
+@Composable
+private fun ProgressCard(step: String, progress: Float, elapsed: Long, indeterminate: Boolean) {
+    val min = elapsed / 60; val sec = elapsed % 60
+    val timeStr = if (elapsed > 0) "  ⏱ %d:%02d".format(min, sec) else ""
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = Surface),
+        shape = RoundedCornerShape(16.dp),
+        border = BorderStroke(1.dp, SurfaceVar),
+    ) {
+        Column(Modifier.padding(20.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                CircularProgressIndicator(Modifier.size(16.dp), color = Primary, strokeWidth = 2.dp)
+                Spacer(Modifier.width(10.dp))
+                Text(step + timeStr, fontSize = 13.sp, color = OnSurface,
+                    modifier = Modifier.weight(1f), maxLines = 2)
+            }
+            if (!indeterminate && progress > 0.01f) {
+                Spacer(Modifier.height(12.dp))
+                LinearProgressIndicator(
+                    progress = { progress.coerceIn(0f, 1f) },
+                    modifier = Modifier.fillMaxWidth().height(4.dp),
+                    color = Primary, trackColor = SurfaceVar,
+                )
+                Spacer(Modifier.height(4.dp))
+                Text("${(progress * 100).toInt()}%", fontSize = 11.sp, color = OnSurfaceVar)
+            }
+        }
+    }
+}
+
+@Composable
+private fun ActionButton(label: String, onClick: () -> Unit) {
+    Button(
+        onClick = onClick,
+        modifier = Modifier.fillMaxWidth().height(56.dp),
+        colors = ButtonDefaults.buttonColors(containerColor = AccentIndigo),
+        shape = RoundedCornerShape(14.dp),
+    ) {
+        Text(label, fontWeight = FontWeight.SemiBold, fontSize = 15.sp, color = Color.White)
+    }
+}
+
+@Composable
+private fun ErrorCard(message: String, onRetry: () -> Unit) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFF1A0A0A)),
+        shape = RoundedCornerShape(14.dp),
+        border = BorderStroke(1.dp, ErrorRed.copy(alpha = 0.5f)),
+    ) {
+        Column(Modifier.padding(16.dp)) {
+            Text("Ошибка", fontWeight = FontWeight.SemiBold, color = ErrorRed, fontSize = 14.sp)
+            Spacer(Modifier.height(6.dp))
+            Text(message, fontSize = 12.sp, color = OnSurfaceVar)
+            Spacer(Modifier.height(12.dp))
+            TextButton(onClick = onRetry) { Text("↩ Попробовать снова", color = Primary) }
+        }
+    }
+}
+
+// ─── Result ───────────────────────────────────────────────────────────────────
+
+@Composable
+private fun ResultBlock(state: UiState.Done, onReset: () -> Unit) {
+    val context = LocalContext.current
+    var expandSpeaker by remember { mutableStateOf(false) }
+    var expandPlain by remember { mutableStateOf(false) }
+
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text("✓", fontWeight = FontWeight.Bold, color = AccentGreen, fontSize = 16.sp)
+        Spacer(Modifier.width(6.dp))
+        Text("Готово", fontWeight = FontWeight.SemiBold, color = AccentGreen, fontSize = 15.sp)
+        Spacer(Modifier.weight(1f))
+        TextButton(onClick = onReset) {
+            Text("↩ Новый файл", color = OnSurfaceVar, fontSize = 13.sp)
+        }
+    }
+    Spacer(Modifier.height(12.dp))
+
+    ResultPanel("По спикерам", expandSpeaker, { expandSpeaker = !expandSpeaker }, state.speakerText) {
+        copyText(context, state.speakerText)
+    }
+    Spacer(Modifier.height(8.dp))
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = Surface),
+        shape = RoundedCornerShape(14.dp),
+        border = BorderStroke(1.dp, SurfaceVar),
+    ) {
+        Row(Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically) {
+            Text("Скачать файл", fontSize = 14.sp, color = OnSurface, modifier = Modifier.weight(1f))
+            TextButton(onClick = { saveToDownloads(context, state.speakerText) }) {
+                Text("⬇ .txt", color = Primary, fontSize = 13.sp)
+            }
+        }
+    }
+    Spacer(Modifier.height(8.dp))
+
+    ResultPanel("Сплошной текст", expandPlain, { expandPlain = !expandPlain }, state.fullText) {
+        copyText(context, state.fullText)
+    }
+}
+
+@Composable
+private fun ResultPanel(
+    title: String,
+    expanded: Boolean,
+    onToggle: () -> Unit,
+    content: String,
+    onCopy: () -> Unit,
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = Surface),
+        shape = RoundedCornerShape(14.dp),
+        border = BorderStroke(1.dp, SurfaceVar),
+    ) {
+        Column {
+            Row(
+                Modifier.fillMaxWidth().clickable(onClick = onToggle)
+                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(title, fontSize = 14.sp, color = OnSurface, modifier = Modifier.weight(1f))
+                Text(if (expanded) "▲" else "▼", fontSize = 11.sp, color = OnSurfaceVar)
+            }
+            AnimatedVisibility(visible = expanded) {
+                Column {
+                    HorizontalDivider(color = SurfaceVar, thickness = 1.dp)
+                    Text(
+                        text = content.ifEmpty { "(пусто)" },
+                        modifier = Modifier.fillMaxWidth().padding(16.dp),
+                        fontSize = 12.sp, color = OnSurface,
+                        fontFamily = FontFamily.Monospace, lineHeight = 18.sp,
+                    )
+                    HorizontalDivider(color = SurfaceVar, thickness = 1.dp)
+                    Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
+                        horizontalArrangement = Arrangement.End) {
+                        TextButton(onClick = onCopy) {
+                            Text("Копировать", color = Primary, fontSize = 13.sp)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+private fun copyText(context: android.content.Context, text: String) {
+    val cb = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as ClipboardManager
+    cb.setPrimaryClip(ClipData.newPlainText("transcript", text))
+    Toast.makeText(context, "Скопировано", Toast.LENGTH_SHORT).show()
+}
+
+private fun saveToDownloads(context: android.content.Context, text: String) {
+    try {
+        val name = "astaro_${System.currentTimeMillis()}.txt"
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val values = ContentValues().apply {
+                put(MediaStore.Downloads.DISPLAY_NAME, name)
+                put(MediaStore.Downloads.MIME_TYPE, "text/plain")
+                put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+            }
+            val uri = context.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+            uri?.let { context.contentResolver.openOutputStream(it)?.use { os -> os.write(text.toByteArray()) } }
+        } else {
+            @Suppress("DEPRECATION")
+            File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), name)
+                .writeText(text)
+        }
+        Toast.makeText(context, "Сохранено: $name", Toast.LENGTH_SHORT).show()
+    } catch (e: Exception) {
+        Toast.makeText(context, "Ошибка: ${e.message}", Toast.LENGTH_LONG).show()
+    }
 }
