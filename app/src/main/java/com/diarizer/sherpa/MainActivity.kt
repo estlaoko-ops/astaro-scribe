@@ -155,6 +155,7 @@ private sealed class UiState {
     data class Done(
         val segments: List<ServerApi.Segment>,
         val fullText: String,
+        val hasDiarization: Boolean = true,
     ) : UiState()
     data class Error(val message: String) : UiState()
 }
@@ -191,6 +192,7 @@ private fun MainScreen() {
     var lastLoggedStep by remember { mutableStateOf("") }
     var activeUploadJob by remember { mutableStateOf<Job?>(null) }
     var speakerNames by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
+    var selectedMode by remember { mutableStateOf("diarize") }
 
     // ── Permission: POST_NOTIFICATIONS (Android 13+) ───────────────────────
     val notifPermLauncher = rememberLauncherForActivityResult(
@@ -235,9 +237,13 @@ private fun MainScreen() {
                         prefs.edit().remove("job_id").remove("start_ms").remove("file_name").remove("step_log").apply()
                         activity.stopService(Intent(activity, TranscriberService::class.java))
                         val segs = s.segments ?: emptyList()
-                        val rawSpeakers = segs.map { it.speaker }.distinct().sorted()
-                        speakerNames = rawSpeakers.mapIndexed { i, id2 -> id2 to "Спикер ${i + 1}" }.toMap()
-                        val initialSpeakerText = buildSpeakerText(segs, speakerNames)
+                        val rawSpeakers = segs.map { it.speaker }.filter { it.isNotEmpty() }.distinct().sorted()
+                        speakerNames = if (s.hasDiarization)
+                            rawSpeakers.mapIndexed { i, id2 -> id2 to "Спикер ${i + 1}" }.toMap()
+                        else emptyMap()
+                        val initialSpeakerText = if (s.hasDiarization)
+                            buildSpeakerText(segs, speakerNames)
+                        else s.fullText ?: ""
                         HistoryManager.add(prefs, HistoryEntry(
                             id = UUID.randomUUID().toString(),
                             timestamp = System.currentTimeMillis(),
@@ -245,7 +251,7 @@ private fun MainScreen() {
                             speakerText = initialSpeakerText,
                             fullText = s.fullText ?: "",
                         ))
-                        uiState = UiState.Done(segs, s.fullText ?: "")
+                        uiState = UiState.Done(segs, s.fullText ?: "", s.hasDiarization)
                         jobId = null
                         break
                     }
@@ -313,8 +319,9 @@ private fun MainScreen() {
     }
 
     // ── Upload ─────────────────────────────────────────────────────────────
-    fun startUpload() {
+    fun startUpload(mode: String) {
         val uri = selectedUri ?: return
+        selectedMode = mode
         startMs = System.currentTimeMillis()
         stepLog = emptyList(); lastLoggedStep = ""
         uiState = UiState.Uploading
@@ -324,7 +331,7 @@ private fun MainScreen() {
         )
         activeUploadJob = scope.launch {
             try {
-                val id = ServerApi.submitJob(context, uri)
+                val id = ServerApi.submitJob(context, uri, mode)
                 if (!isActive) return@launch
                 activeUploadJob = null
                 prefs.edit().putString("job_id", id).putLong("start_ms", startMs).putString("file_name", selectedName).apply()
@@ -405,7 +412,10 @@ private fun MainScreen() {
                 is UiState.FileSelected -> {
                     FileCard(s.name, s.sizeMb) { filePicker.launch("audio/*") }
                     Spacer(Modifier.height(16.dp))
-                    ActionButton("Загрузить и обработать") { startUpload() }
+                    ModeButtons(
+                        onFast = { startUpload("fast") },
+                        onDiarize = { startUpload("diarize") },
+                    )
                 }
 
                 is UiState.Uploading -> {
@@ -437,7 +447,8 @@ private fun MainScreen() {
 
                 is UiState.Done -> {
                     val speakerText = remember(s.segments, speakerNames) {
-                        buildSpeakerText(s.segments, speakerNames)
+                        if (s.hasDiarization) buildSpeakerText(s.segments, speakerNames)
+                        else s.fullText
                     }
                     ResultBlock(
                         state = s,
@@ -624,6 +635,7 @@ private fun ResultBlock(
     onReset: () -> Unit,
 ) {
     val context = LocalContext.current
+    val hasDiarization = state.hasDiarization
     var expandSpeaker by remember { mutableStateOf(true) }
     var expandPlain by remember { mutableStateOf(false) }
     var showRenameDialog by remember { mutableStateOf(false) }
@@ -676,8 +688,11 @@ private fun ResultBlock(
                     .padding(horizontal = 16.dp, vertical = 12.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Text("По спикерам", fontSize = 14.sp, color = OnSurface, modifier = Modifier.weight(1f))
-                if (speakerNames.isNotEmpty()) {
+                Text(
+                    if (hasDiarization) "По спикерам" else "Транскрипция",
+                    fontSize = 14.sp, color = OnSurface, modifier = Modifier.weight(1f),
+                )
+                if (hasDiarization && speakerNames.isNotEmpty()) {
                     TextButton(
                         onClick = { showRenameDialog = true },
                         contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
@@ -703,31 +718,55 @@ private fun ResultBlock(
                             .verticalScroll(segsScrollState),
                     ) {
                         state.segments.forEachIndexed { i, seg ->
-                            val color = speakerColor(seg.speaker, allSpeakers)
-                            val name = speakerNames[seg.speaker] ?: seg.speaker
                             val isActive = i == currentSegIdx
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .background(if (isActive) color.copy(alpha = 0.12f) else Color.Transparent)
-                                    .clickable { seekPositionMs = (seg.start * 1000).toLong() }
-                                    .padding(horizontal = 12.dp, vertical = 5.dp),
-                                verticalAlignment = Alignment.Top,
-                            ) {
-                                Box(
+                            if (hasDiarization) {
+                                val color = speakerColor(seg.speaker, allSpeakers)
+                                val name = speakerNames[seg.speaker] ?: seg.speaker
+                                Row(
                                     modifier = Modifier
-                                        .width(3.dp)
-                                        .height(with(density) { 48.dp })
-                                        .background(if (isActive) color else color.copy(alpha = 0.35f),
-                                            RoundedCornerShape(2.dp))
-                                )
-                                Spacer(Modifier.width(10.dp))
-                                Column(Modifier.weight(1f)) {
-                                    Text(name, fontSize = 11.sp, color = color, fontWeight = FontWeight.SemiBold)
-                                    Text(seg.text, fontSize = 12.sp, color = OnSurface, lineHeight = 17.sp)
+                                        .fillMaxWidth()
+                                        .background(if (isActive) color.copy(alpha = 0.12f) else Color.Transparent)
+                                        .clickable { seekPositionMs = (seg.start * 1000).toLong() }
+                                        .padding(horizontal = 12.dp, vertical = 5.dp),
+                                    verticalAlignment = Alignment.Top,
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .width(3.dp)
+                                            .height(with(density) { 48.dp })
+                                            .background(
+                                                if (isActive) color else color.copy(alpha = 0.35f),
+                                                RoundedCornerShape(2.dp),
+                                            )
+                                    )
+                                    Spacer(Modifier.width(10.dp))
+                                    Column(Modifier.weight(1f)) {
+                                        Text(name, fontSize = 11.sp, color = color, fontWeight = FontWeight.SemiBold)
+                                        Text(seg.text, fontSize = 12.sp, color = OnSurface, lineHeight = 17.sp)
+                                    }
+                                    Text(fmtDuration(seg.start.toLong()), fontSize = 10.sp, color = OnSurfaceVar,
+                                        modifier = Modifier.padding(start = 8.dp, top = 2.dp))
                                 }
-                                Text(fmtDuration(seg.start.toLong()), fontSize = 10.sp, color = OnSurfaceVar,
-                                    modifier = Modifier.padding(start = 8.dp, top = 2.dp))
+                            } else {
+                                // Fast mode: no speaker colors, just timestamp + text
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .background(if (isActive) Primary.copy(alpha = 0.10f) else Color.Transparent)
+                                        .clickable { seekPositionMs = (seg.start * 1000).toLong() }
+                                        .padding(horizontal = 12.dp, vertical = 6.dp),
+                                    verticalAlignment = Alignment.Top,
+                                ) {
+                                    Text(
+                                        fmtDuration(seg.start.toLong()),
+                                        fontSize = 10.sp, color = if (isActive) Primary else OnSurfaceVar,
+                                        fontFamily = FontFamily.Monospace,
+                                        fontWeight = if (isActive) FontWeight.SemiBold else FontWeight.Normal,
+                                        modifier = Modifier.width(40.dp).padding(top = 2.dp),
+                                    )
+                                    Text(seg.text, fontSize = 12.sp, color = OnSurface,
+                                        lineHeight = 17.sp, modifier = Modifier.weight(1f))
+                                }
                             }
                         }
                     }
@@ -1018,6 +1057,40 @@ private fun StepLogCard(log: List<StepEntry>) {
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ModeButtons(onFast: () -> Unit, onDiarize: () -> Unit) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        // Fast button
+        OutlinedButton(
+            onClick = onFast,
+            modifier = Modifier.weight(1f).height(72.dp),
+            shape = RoundedCornerShape(14.dp),
+            colors = ButtonDefaults.outlinedButtonColors(contentColor = AccentGreen),
+            border = BorderStroke(1.5.dp, AccentGreen.copy(alpha = 0.6f)),
+        ) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Text("⚡ Только текст", fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                Text("быстро · без спикеров", fontSize = 10.sp, color = OnSurfaceVar)
+            }
+        }
+        // Diarize button
+        Button(
+            onClick = onDiarize,
+            modifier = Modifier.weight(1f).height(72.dp),
+            shape = RoundedCornerShape(14.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = AccentIndigo),
+        ) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Text("👥 Со спикерами", fontWeight = FontWeight.SemiBold, fontSize = 14.sp, color = Color.White)
+                Text("медленно · кто что сказал", fontSize = 10.sp, color = Color.White.copy(alpha = 0.7f))
             }
         }
     }

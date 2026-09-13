@@ -29,6 +29,7 @@ object ServerApi {
         val segsTotal: Int = 0,
         val phaseElapsedSec: Int = 0,
         val segErrors: List<String> = emptyList(),
+        val hasDiarization: Boolean = true,
     )
 
     private val baseUrl: String get() =
@@ -38,8 +39,8 @@ object ServerApi {
 
     private val auth: String get() = BuildConfig.WHISPER_AUTH
 
-    suspend fun submitJob(context: Context, uri: Uri): String = withContext(Dispatchers.IO) {
-        val submitUrl = "$baseUrl/pipeline/submit"
+    suspend fun submitJob(context: Context, uri: Uri, mode: String = "diarize"): String = withContext(Dispatchers.IO) {
+        val submitUrl = "$baseUrl/pipeline/submit?mode=$mode"
 
         val cr = context.contentResolver
         val mimeType = cr.getType(uri) ?: "audio/mpeg"
@@ -122,6 +123,7 @@ object ServerApi {
         val segsDone = json.optInt("seg_done", 0)
         val segsTotal = json.optInt("seg_total", 0)
         val phaseElapsed = json.optInt("phase_elapsed_sec", 0)
+        val hasDiarization = json.optBoolean("has_diarization", true)
         val segErrors = buildList {
             val arr = json.optJSONArray("seg_errors") ?: return@buildList
             repeat(arr.length()) { add(arr.getString(it)) }
@@ -145,6 +147,7 @@ object ServerApi {
                     errorMessage = null,
                     segsDone = segsDone, segsTotal = segsTotal,
                     phaseElapsedSec = phaseElapsed, segErrors = segErrors,
+                    hasDiarization = hasDiarization,
                 )
             }
             "error" -> JobStatus(
