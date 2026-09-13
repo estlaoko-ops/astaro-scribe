@@ -5,8 +5,9 @@ Astaro Scribe — Pipeline Gateway
 Развёрнуто по адресу: /opt/apps/local-models/pipeline-gateway/server.py
 
 Сервис:
-    POST /pipeline/submit   — принять аудиофайл, вернуть {"job_id": "..."}
-    GET  /pipeline/status/<job_id> — статус + результат
+    POST /pipeline/submit        — принять аудиофайл, вернуть {"job_id": "..."}
+    POST /pipeline/cancel/<id>   — отменить задачу
+    GET  /pipeline/status/<id>   — статус + результат
 
 Вызывает:
     diarization-gateway:8070/diarize  — Pyannote speaker diarization
@@ -32,6 +33,13 @@ app = Flask(__name__)
 WHISPER_URL = "http://whisper-gateway:8050/transcribe"
 DIARIZE_URL = "http://diarization-gateway:8070/diarize"
 
+# Max merged segment duration sent to Whisper (seconds)
+MAX_SEG_DURATION = 25.0
+# Max gap between same-speaker segments to merge (seconds)
+MAX_MERGE_GAP = 1.0
+# Timeout per Whisper call
+WHISPER_TIMEOUT = 120
+
 jobs: dict[str, dict] = {}
 jobs_lock = threading.Lock()
 
@@ -45,6 +53,28 @@ def update_job(job_id: str, **kwargs):
     with jobs_lock:
         if job_id in jobs:
             jobs[job_id].update(kwargs)
+
+
+def merge_diarization_segments(segments: list[dict]) -> list[dict]:
+    """
+    Merge adjacent same-speaker segments to reduce Whisper API call count.
+    888 short segments from Pyannote → ~150-200 longer ones.
+    Constraints: gap ≤ MAX_MERGE_GAP and total duration ≤ MAX_SEG_DURATION.
+    """
+    if not segments:
+        return segments
+    merged = [dict(segments[0])]
+    for seg in segments[1:]:
+        last = merged[-1]
+        gap = seg["start"] - last["end"]
+        would_be_duration = seg["end"] - last["start"]
+        if (seg["speaker"] == last["speaker"]
+                and gap <= MAX_MERGE_GAP
+                and would_be_duration <= MAX_SEG_DURATION):
+            last["end"] = seg["end"]
+        else:
+            merged.append(dict(seg))
+    return merged
 
 
 @app.route("/pipeline/health", methods=["GET"])
@@ -73,6 +103,10 @@ def submit():
             "cancelled": False,
             "result": None,
             "error": None,
+            "seg_done": 0,
+            "seg_total": 0,
+            "phase_start": time.time(),
+            "seg_errors": [],
         }
 
     t = threading.Thread(target=process_job, args=(job_id, tmp.name), daemon=True)
@@ -99,7 +133,16 @@ def status(job_id):
     if job is None:
         return jsonify({"error": "not found"}), 404
 
-    resp = {"status": job["status"], "step": job["step"], "progress": job["progress"]}
+    phase_elapsed = int(time.time() - job.get("phase_start", time.time()))
+    resp = {
+        "status": job["status"],
+        "step": job["step"],
+        "progress": job["progress"],
+        "seg_done": job.get("seg_done", 0),
+        "seg_total": job.get("seg_total", 0),
+        "phase_elapsed_sec": phase_elapsed,
+        "seg_errors": job.get("seg_errors", []),
+    }
     if job["status"] == "done":
         resp.update(job["result"])
     elif job["status"] == "error":
@@ -110,8 +153,11 @@ def status(job_id):
 def process_job(job_id: str, audio_path: str):
     extra_paths: list[str] = []
     try:
-        # 1. Diarization
-        update_job(job_id, step="Диаризация (определение спикеров)...", progress=0.05)
+        # ── 1. Diarization ────────────────────────────────────────────────────
+        update_job(job_id,
+                   step="Диаризация (определение спикеров)...",
+                   progress=0.05,
+                   phase_start=time.time())
         log(f"[{job_id}] diarizing...")
 
         with open(audio_path, "rb") as f:
@@ -122,21 +168,32 @@ def process_job(job_id: str, audio_path: str):
             )
 
         if r.status_code != 200:
-            raise RuntimeError(f"Diarization failed {r.status_code}: {r.text[:300]}")
+            raise RuntimeError(f"Ошибка диаризации ({r.status_code}): {r.text[:300]}")
 
         data = r.json()
-        segments = data.get("segments", [])
-        log(f"[{job_id}] diarization: {len(segments)} segs, {data.get('num_speakers')} speakers")
+        raw_segments = data.get("segments", [])
+        num_speakers = data.get("num_speakers", "?")
+        log(f"[{job_id}] diarization raw: {len(raw_segments)} segs, {num_speakers} speakers")
 
-        if not segments:
-            raise RuntimeError("Диаризация не нашла ни одного сегмента")
+        if not raw_segments:
+            raise RuntimeError("Диаризация не нашла ни одного сегмента в аудио")
 
         with jobs_lock:
             if jobs[job_id].get("cancelled"):
                 return
 
-        # 2. Convert to 16 kHz WAV for slicing
-        update_job(job_id, step="Подготовка аудио для транскрибации...", progress=0.30)
+        # ── 2. Pre-merge segments ─────────────────────────────────────────────
+        segments = merge_diarization_segments(raw_segments)
+        log(f"[{job_id}] after merge: {len(raw_segments)} → {len(segments)} segs "
+            f"(max {MAX_SEG_DURATION}s, gap ≤ {MAX_MERGE_GAP}s), {num_speakers} speakers")
+        update_job(job_id, step=f"Диаризация: {num_speakers} спикеров, {len(segments)} сегментов",
+                   progress=0.28)
+
+        # ── 3. Convert to 16 kHz WAV ──────────────────────────────────────────
+        update_job(job_id,
+                   step="Конвертация аудио...",
+                   progress=0.30,
+                   phase_start=time.time())
         wav_path = audio_path + "_16k.wav"
         extra_paths.append(wav_path)
         res = subprocess.run(
@@ -146,9 +203,15 @@ def process_job(job_id: str, audio_path: str):
         if res.returncode != 0:
             raise RuntimeError(f"ffmpeg failed: {res.stderr.decode()[:500]}")
 
-        # 3. Transcribe each segment
+        # ── 4. Transcribe each segment ────────────────────────────────────────
         transcribed: list[dict] = []
         full_text_parts: list[str] = []
+        seg_errors: list[str] = []
+
+        update_job(job_id,
+                   seg_total=len(segments),
+                   seg_done=0,
+                   phase_start=time.time())
 
         for i, seg in enumerate(segments):
             with jobs_lock:
@@ -157,8 +220,9 @@ def process_job(job_id: str, audio_path: str):
 
             prog = 0.35 + 0.60 * (i / len(segments))
             update_job(job_id,
-                step=f"Транскрибация: {i+1}/{len(segments)}...",
-                progress=round(prog, 3))
+                       step=f"Транскрибация: {i + 1}/{len(segments)}...",
+                       progress=round(prog, 3),
+                       seg_done=i)
 
             duration = round(seg["end"] - seg["start"], 3)
             if duration < 0.3:
@@ -175,6 +239,9 @@ def process_job(job_id: str, audio_path: str):
             ], capture_output=True)
 
             if r2.returncode != 0 or not os.path.exists(seg_path):
+                err = f"seg {i}: ffmpeg slice failed"
+                log(f"[{job_id}] {err}")
+                seg_errors.append(err)
                 continue
 
             try:
@@ -182,7 +249,7 @@ def process_job(job_id: str, audio_path: str):
                     wr = requests.post(
                         WHISPER_URL,
                         files={"audio": ("segment.wav", sf, "audio/wav")},
-                        timeout=600,
+                        timeout=WHISPER_TIMEOUT,
                     )
                 if wr.status_code == 200:
                     text = wr.json().get("text", "").strip()
@@ -194,10 +261,25 @@ def process_job(job_id: str, audio_path: str):
                             "text": text,
                         })
                         full_text_parts.append(text)
+                else:
+                    err = f"seg {i}: whisper HTTP {wr.status_code}"
+                    log(f"[{job_id}] {err}")
+                    seg_errors.append(err)
+            except requests.exceptions.Timeout:
+                err = f"seg {i}: whisper timeout ({WHISPER_TIMEOUT}s)"
+                log(f"[{job_id}] {err}")
+                seg_errors.append(err)
             except Exception as e:
-                log(f"[{job_id}] seg {i} failed: {e}")
+                err = f"seg {i}: {e}"
+                log(f"[{job_id}] {err}")
+                seg_errors.append(err)
 
-        # 4. Merge consecutive same-speaker segments
+            if seg_errors:
+                update_job(job_id, seg_errors=list(seg_errors))
+
+        update_job(job_id, seg_done=len(segments))
+
+        # ── 5. Merge consecutive same-speaker transcribed segments ────────────
         merged: list[dict] = []
         for seg in transcribed:
             if merged and merged[-1]["speaker"] == seg["speaker"]:
@@ -206,13 +288,20 @@ def process_job(job_id: str, audio_path: str):
             else:
                 merged.append(dict(seg))
 
+        if not merged:
+            raise RuntimeError(
+                f"Транскрибация не дала результата. Сегментов обработано: {len(segments)}, "
+                f"ошибок: {len(seg_errors)}. "
+                + (f"Первая ошибка: {seg_errors[0]}" if seg_errors else "")
+            )
+
         update_job(job_id,
-            status="done", step="Готово", progress=1.0,
-            result={"segments": merged, "full_text": " ".join(full_text_parts)})
-        log(f"[{job_id}] done: {len(merged)} merged segments")
+                   status="done", step="Готово", progress=1.0,
+                   result={"segments": merged, "full_text": " ".join(full_text_parts)})
+        log(f"[{job_id}] done: {len(merged)} merged segments, {len(seg_errors)} seg errors")
 
     except Exception as e:
-        log(f"[{job_id}] error: {e}")
+        log(f"[{job_id}] FATAL: {e}")
         update_job(job_id, status="error", step="Ошибка", error=str(e))
 
     finally:

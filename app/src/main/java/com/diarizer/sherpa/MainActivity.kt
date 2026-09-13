@@ -144,7 +144,14 @@ private sealed class UiState {
     object Idle : UiState()
     data class FileSelected(val name: String, val sizeMb: Float) : UiState()
     object Uploading : UiState()
-    data class Processing(val step: String, val progress: Float) : UiState()
+    data class Processing(
+        val step: String,
+        val progress: Float,
+        val segsDone: Int = 0,
+        val segsTotal: Int = 0,
+        val phaseElapsedSec: Int = 0,
+        val segErrors: List<String> = emptyList(),
+    ) : UiState()
     data class Done(
         val segments: List<ServerApi.Segment>,
         val fullText: String,
@@ -261,7 +268,14 @@ private fun MainScreen() {
                             stepLog = stepLog + StepEntry(s.step, elapsed)
                             saveStepLog(prefs, stepLog)
                         }
-                        uiState = UiState.Processing(s.step, s.progress)
+                        uiState = UiState.Processing(
+                            step = s.step,
+                            progress = s.progress,
+                            segsDone = s.segsDone,
+                            segsTotal = s.segsTotal,
+                            phaseElapsedSec = s.phaseElapsedSec,
+                            segErrors = s.segErrors,
+                        )
                         TranscriberService.postProgress(context, s.step, (s.progress * 100).toInt(), s.progress < 0.05f)
                     }
                 }
@@ -395,7 +409,7 @@ private fun MainScreen() {
                 }
 
                 is UiState.Uploading -> {
-                    ProgressCard("Загрузка на сервер...", 0f, elapsedSec, true)
+                    ProgressCard(step = "Загрузка на сервер...", progress = 0f, elapsedSec = elapsedSec, indeterminate = true)
                     Spacer(Modifier.height(8.dp))
                     CancelButton { cancelCurrentJob() }
                 }
@@ -403,7 +417,16 @@ private fun MainScreen() {
                 is UiState.Processing -> {
                     FileCard(selectedName, 0f, compact = true, onChangeTap = null)
                     Spacer(Modifier.height(12.dp))
-                    ProgressCard(s.step, s.progress, elapsedSec, s.progress < 0.01f)
+                    ProgressCard(
+                        step = s.step,
+                        progress = s.progress,
+                        elapsedSec = elapsedSec,
+                        indeterminate = s.progress < 0.01f,
+                        segsDone = s.segsDone,
+                        segsTotal = s.segsTotal,
+                        phaseElapsedSec = s.phaseElapsedSec,
+                        segErrors = s.segErrors,
+                    )
                     if (stepLog.isNotEmpty()) {
                         Spacer(Modifier.height(8.dp))
                         StepLogCard(stepLog)
@@ -893,10 +916,29 @@ private fun FileCard(name: String, sizeMb: Float, compact: Boolean = false, onCh
 }
 
 @Composable
-private fun ProgressCard(step: String, progress: Float, elapsed: Long, indeterminate: Boolean) {
-    val timeStr = if (elapsed > 0) "  ⏱ ${fmtDuration(elapsed)}" else ""
-    val etaSec = if (progress > 0.05f && elapsed > 5L)
-        (elapsed * (1.0 - progress) / progress).toLong() else -1L
+private fun ProgressCard(
+    step: String,
+    progress: Float,
+    elapsedSec: Long,
+    indeterminate: Boolean,
+    segsDone: Int = 0,
+    segsTotal: Int = 0,
+    phaseElapsedSec: Int = 0,
+    segErrors: List<String> = emptyList(),
+) {
+    val timeStr = if (elapsedSec > 0) "  ⏱ ${fmtDuration(elapsedSec)}" else ""
+
+    // ETA: prefer segment-rate ETA during transcription (much more accurate)
+    val etaSec: Long = when {
+        segsTotal > 0 && segsDone > 0 && phaseElapsedSec > 5 -> {
+            val secsPerSeg = phaseElapsedSec.toLong() / segsDone
+            secsPerSeg * (segsTotal - segsDone)
+        }
+        progress > 0.05f && elapsedSec > 5L ->
+            (elapsedSec * (1.0 - progress) / progress).toLong()
+        else -> -1L
+    }
+
     Card(
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = Surface),
@@ -912,14 +954,34 @@ private fun ProgressCard(step: String, progress: Float, elapsed: Long, indetermi
             }
             if (!indeterminate && progress > 0.01f) {
                 Spacer(Modifier.height(12.dp))
-                LinearProgressIndicator(progress = progress.coerceIn(0f, 1f),
+                LinearProgressIndicator(
+                    progress = progress.coerceIn(0f, 1f),
                     modifier = Modifier.fillMaxWidth().height(4.dp),
-                    color = Primary, trackColor = SurfaceVar)
+                    color = Primary, trackColor = SurfaceVar,
+                )
                 Spacer(Modifier.height(4.dp))
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    Text("${(progress * 100).toInt()}%", fontSize = 11.sp, color = OnSurfaceVar)
+                    if (segsTotal > 0) {
+                        Text("$segsDone / $segsTotal сег",
+                            fontSize = 11.sp, color = Primary, fontWeight = FontWeight.Medium)
+                    } else {
+                        Text("${(progress * 100).toInt()}%", fontSize = 11.sp, color = OnSurfaceVar)
+                    }
                     if (etaSec >= 0)
                         Text("~ещё ${fmtDuration(etaSec)}", fontSize = 11.sp, color = OnSurfaceVar)
+                }
+            }
+            if (segErrors.isNotEmpty()) {
+                Spacer(Modifier.height(8.dp))
+                Divider(color = ErrorRed.copy(alpha = 0.3f), thickness = 1.dp)
+                Spacer(Modifier.height(6.dp))
+                Text("⚠ ${segErrors.size} сегм. не удалось расшифровать",
+                    fontSize = 11.sp, color = ErrorRed.copy(alpha = 0.8f))
+                if (segErrors.size <= 3) {
+                    segErrors.forEach { e ->
+                        Text("  · $e", fontSize = 10.sp, color = OnSurfaceVar,
+                            fontFamily = FontFamily.Monospace)
+                    }
                 }
             }
         }

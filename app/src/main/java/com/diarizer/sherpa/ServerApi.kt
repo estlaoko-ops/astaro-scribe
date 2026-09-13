@@ -25,6 +25,10 @@ object ServerApi {
         val segments: List<Segment>?,
         val fullText: String?,
         val errorMessage: String?,
+        val segsDone: Int = 0,
+        val segsTotal: Int = 0,
+        val phaseElapsedSec: Int = 0,
+        val segErrors: List<String> = emptyList(),
     )
 
     private val baseUrl: String get() =
@@ -115,6 +119,13 @@ object ServerApi {
         val status = json.getString("status")
         val step = json.optString("step", "")
         val progress = json.optDouble("progress", 0.0).toFloat()
+        val segsDone = json.optInt("seg_done", 0)
+        val segsTotal = json.optInt("seg_total", 0)
+        val phaseElapsed = json.optInt("phase_elapsed_sec", 0)
+        val segErrors = buildList {
+            val arr = json.optJSONArray("seg_errors") ?: return@buildList
+            repeat(arr.length()) { add(arr.getString(it)) }
+        }
 
         when (status) {
             "done" -> {
@@ -129,29 +140,25 @@ object ServerApi {
                     )
                 }
                 JobStatus(
-                    status = "done",
-                    step = step,
-                    progress = progress,
-                    segments = segments,
-                    fullText = json.optString("full_text", ""),
+                    status = "done", step = step, progress = progress,
+                    segments = segments, fullText = json.optString("full_text", ""),
                     errorMessage = null,
+                    segsDone = segsDone, segsTotal = segsTotal,
+                    phaseElapsedSec = phaseElapsed, segErrors = segErrors,
                 )
             }
             "error" -> JobStatus(
-                status = "error",
-                step = step,
-                progress = progress,
-                segments = null,
-                fullText = null,
+                status = "error", step = step, progress = progress,
+                segments = null, fullText = null,
                 errorMessage = json.optString("message", "Неизвестная ошибка"),
+                segsDone = segsDone, segsTotal = segsTotal,
+                phaseElapsedSec = phaseElapsed, segErrors = segErrors,
             )
             else -> JobStatus(
-                status = status,
-                step = step,
-                progress = progress,
-                segments = null,
-                fullText = null,
-                errorMessage = null,
+                status = status, step = step, progress = progress,
+                segments = null, fullText = null, errorMessage = null,
+                segsDone = segsDone, segsTotal = segsTotal,
+                phaseElapsedSec = phaseElapsed, segErrors = segErrors,
             )
         }
     }
