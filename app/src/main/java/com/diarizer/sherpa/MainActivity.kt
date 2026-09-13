@@ -348,7 +348,7 @@ private fun ProgressCard(step: String, progress: Float, elapsed: Long, indetermi
             if (!indeterminate && progress > 0.01f) {
                 Spacer(Modifier.height(12.dp))
                 LinearProgressIndicator(
-                    progress = { progress.coerceIn(0f, 1f) },
+                    progress = progress.coerceIn(0f, 1f),
                     modifier = Modifier.fillMaxWidth().height(4.dp),
                     color = Primary, trackColor = SurfaceVar,
                 )
@@ -459,14 +459,14 @@ private fun ResultPanel(
             }
             AnimatedVisibility(visible = expanded) {
                 Column {
-                    HorizontalDivider(color = SurfaceVar, thickness = 1.dp)
+                    Divider(color = SurfaceVar, thickness = 1.dp)
                     Text(
                         text = content.ifEmpty { "(пусто)" },
                         modifier = Modifier.fillMaxWidth().padding(16.dp),
                         fontSize = 12.sp, color = OnSurface,
                         fontFamily = FontFamily.Monospace, lineHeight = 18.sp,
                     )
-                    HorizontalDivider(color = SurfaceVar, thickness = 1.dp)
+                    Divider(color = SurfaceVar, thickness = 1.dp)
                     Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
                         horizontalArrangement = Arrangement.End) {
                         TextButton(onClick = onCopy) {
