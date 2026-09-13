@@ -177,6 +177,39 @@ private fun MainScreen() {
         }
     }
 
+    // ── Version history ────────────────────────────────────────────────────
+    var showVersionHistory by remember { mutableStateOf(false) }
+    val versionHistory = listOf(
+        "v7.0 — Server-side pipeline, thin client",
+        "v6.9 · Phoenicia · Whisper Small INT8",
+        "v6.8 · Hittite · Whisper Small INT8",
+        "v6.7 · Assyria · Whisper Small INT8",
+        "v6.6 · Babylon · Whisper Small INT8",
+        "v6.5 · Persia · Whisper Small INT8",
+    )
+    if (showVersionHistory) {
+        AlertDialog(
+            onDismissRequest = { showVersionHistory = false },
+            title = { Text("История версий") },
+            text = {
+                Column {
+                    versionHistory.forEach { entry ->
+                        Text(
+                            entry,
+                            style = TextStyle(fontSize = 13.sp, color = OnSurface,
+                                fontFamily = FontFamily.Monospace),
+                            modifier = Modifier.padding(vertical = 3.dp),
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showVersionHistory = false }) { Text("Закрыть") }
+            },
+            containerColor = Surface,
+        )
+    }
+
     // ── Layout ─────────────────────────────────────────────────────────────
     Surface(modifier = Modifier.fillMaxSize(), color = Background) {
         Column(
@@ -192,7 +225,11 @@ private fun MainScreen() {
                 style = TextStyle(fontSize = 22.sp, fontWeight = FontWeight.Bold,
                     color = Primary, letterSpacing = 0.3.sp),
             )
-            Text("v7.0", style = TextStyle(fontSize = 12.sp, color = OnSurfaceVar))
+            Text(
+                "v7.0",
+                style = TextStyle(fontSize = 12.sp, color = OnSurfaceVar),
+                modifier = Modifier.clickable { showVersionHistory = true },
+            )
             Spacer(Modifier.height(28.dp))
 
             when (val s = uiState) {
