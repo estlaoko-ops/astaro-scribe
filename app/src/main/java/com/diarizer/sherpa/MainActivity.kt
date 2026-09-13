@@ -321,6 +321,12 @@ private fun MainScreen() {
     // ── Upload ─────────────────────────────────────────────────────────────
     fun startUpload(mode: String) {
         val uri = selectedUri ?: return
+        // Guard: already uploading — ignore extra taps
+        if (uiState is UiState.Uploading || uiState is UiState.Processing) return
+        // Cancel any lingering previous job
+        activeUploadJob?.cancel()
+        activeUploadJob = null
+
         selectedMode = mode
         startMs = System.currentTimeMillis()
         stepLog = emptyList(); lastLoggedStep = ""
@@ -330,18 +336,39 @@ private fun MainScreen() {
                 .putExtra("status_text", "Загрузка на сервер...")
         )
         activeUploadJob = scope.launch {
-            try {
-                val id = ServerApi.submitJob(context, uri, mode)
+            var lastError: Exception? = null
+            // Retry up to 3 times for transient network errors (DNS flap, timeout)
+            for (attempt in 1..3) {
                 if (!isActive) return@launch
-                activeUploadJob = null
-                prefs.edit().putString("job_id", id).putLong("start_ms", startMs).putString("file_name", selectedName).apply()
-                jobId = id
-                uiState = UiState.Processing("Задача принята, обрабатывается...", 0f)
-            } catch (e: Exception) {
-                if (!isActive) return@launch
-                activity.stopService(Intent(activity, TranscriberService::class.java))
-                uiState = UiState.Error(e.message ?: "Ошибка загрузки")
+                try {
+                    val id = ServerApi.submitJob(context, uri, mode)
+                    if (!isActive) return@launch
+                    activeUploadJob = null
+                    prefs.edit()
+                        .putString("job_id", id)
+                        .putLong("start_ms", startMs)
+                        .putString("file_name", selectedName)
+                        .apply()
+                    jobId = id
+                    uiState = UiState.Processing("Задача принята, обрабатывается...", 0f)
+                    return@launch
+                } catch (e: Exception) {
+                    if (!isActive) return@launch
+                    lastError = e
+                    if (attempt < 3) {
+                        uiState = UiState.Uploading  // stay in uploading, show retry implicitly
+                        delay(2_000L * attempt)      // 2s, 4s back-off
+                    }
+                }
             }
+            // All 3 attempts failed
+            activity.stopService(Intent(activity, TranscriberService::class.java))
+            val msg = lastError?.message ?: "Ошибка загрузки"
+            uiState = UiState.Error(
+                if ("resolve host" in msg || "UnknownHost" in msg)
+                    "Не удалось подключиться к серверу.\nПроверьте интернет-соединение."
+                else msg
+            )
         }
     }
 
@@ -1064,26 +1091,29 @@ private fun StepLogCard(log: List<StepEntry>) {
 
 @Composable
 private fun ModeButtons(onFast: () -> Unit, onDiarize: () -> Unit) {
+    var clicked by remember { mutableStateOf(false) }
+    val enabled = !clicked
+
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        // Fast button
         OutlinedButton(
-            onClick = onFast,
+            onClick = { if (enabled) { clicked = true; onFast() } },
+            enabled = enabled,
             modifier = Modifier.weight(1f).height(72.dp),
             shape = RoundedCornerShape(14.dp),
             colors = ButtonDefaults.outlinedButtonColors(contentColor = AccentGreen),
-            border = BorderStroke(1.5.dp, AccentGreen.copy(alpha = 0.6f)),
+            border = BorderStroke(1.5.dp, AccentGreen.copy(alpha = if (enabled) 0.6f else 0.2f)),
         ) {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 Text("⚡ Только текст", fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
                 Text("быстро · без спикеров", fontSize = 10.sp, color = OnSurfaceVar)
             }
         }
-        // Diarize button
         Button(
-            onClick = onDiarize,
+            onClick = { if (enabled) { clicked = true; onDiarize() } },
+            enabled = enabled,
             modifier = Modifier.weight(1f).height(72.dp),
             shape = RoundedCornerShape(14.dp),
             colors = ButtonDefaults.buttonColors(containerColor = AccentIndigo),
