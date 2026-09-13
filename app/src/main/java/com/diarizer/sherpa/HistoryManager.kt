@@ -10,12 +10,15 @@ data class HistoryEntry(
     val fileName: String,
     val speakerText: String,
     val fullText: String,
+    val audioDurationSec: Long = 0L,
+    val processingTimeSec: Long = 0L,
+    val mode: String = "diarize",
 )
 
 object HistoryManager {
     private const val KEY = "transcription_history"
     private const val MAX_ENTRIES = 50
-    private const val TTL_MS = 7L * 24 * 60 * 60 * 1000  // 7 days
+    private const val TTL_MS = 7L * 24 * 60 * 60 * 1000
 
     fun load(prefs: SharedPreferences): List<HistoryEntry> {
         val json = prefs.getString(KEY, null) ?: return emptyList()
@@ -32,6 +35,9 @@ object HistoryManager {
                     fileName = o.getString("fileName"),
                     speakerText = o.getString("speakerText"),
                     fullText = o.getString("fullText"),
+                    audioDurationSec = o.optLong("audioDurationSec", 0L),
+                    processingTimeSec = o.optLong("processingTimeSec", 0L),
+                    mode = o.optString("mode", "diarize"),
                 )
             }.sortedByDescending { it.timestamp }
         } catch (_: Exception) { emptyList() }
@@ -56,7 +62,10 @@ object HistoryManager {
                 .put("timestamp", e.timestamp)
                 .put("fileName", e.fileName)
                 .put("speakerText", e.speakerText)
-                .put("fullText", e.fullText))
+                .put("fullText", e.fullText)
+                .put("audioDurationSec", e.audioDurationSec)
+                .put("processingTimeSec", e.processingTimeSec)
+                .put("mode", e.mode))
         }
         prefs.edit().putString(KEY, arr.toString()).apply()
     }

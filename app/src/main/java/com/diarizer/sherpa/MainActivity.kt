@@ -6,6 +6,7 @@ import android.content.ContentValues
 import android.content.Intent
 import android.content.SharedPreferences
 import android.media.MediaPlayer
+import android.media.PlaybackParams
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -23,7 +24,11 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Pause
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -34,6 +39,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -87,12 +93,21 @@ private val AppColorScheme = darkColorScheme(
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 private fun fmtDuration(sec: Long): String {
-    val m = sec / 60; val s = sec % 60
-    return if (m > 0) "%d:%02d".format(m, s) else "${s}с"
+    if (sec <= 0L) return "0с"
+    val h = sec / 3600; val m = (sec % 3600) / 60; val s = sec % 60
+    return if (h > 0) "%d:%02d:%02d".format(h, m, s)
+    else if (m > 0) "%d:%02d".format(m, s)
+    else "${s}с"
 }
 
 private fun fmtDate(ms: Long): String =
     SimpleDateFormat("d MMM, HH:mm", Locale("ru")).format(Date(ms))
+
+private fun fmtProcessingTime(sec: Long): String = when {
+    sec <= 0L -> ""
+    sec < 60L -> "${sec}с"
+    else -> "${sec / 60} мин"
+}
 
 private fun buildSpeakerText(
     segments: List<ServerApi.Segment>,
@@ -117,6 +132,17 @@ private fun speakerColor(rawId: String, allSpeakers: List<String>): Color {
     return SpeakerPalette[idx % SpeakerPalette.size]
 }
 
+private fun parseTimeInput(s: String): Float? {
+    val parts = s.trim().split(":")
+    return try {
+        when (parts.size) {
+            1 -> parts[0].toFloat()
+            2 -> parts[0].toInt() * 60f + parts[1].toFloat()
+            else -> null
+        }
+    } catch (_: Exception) { null }
+}
+
 private fun saveStepLog(prefs: SharedPreferences, log: List<StepEntry>) {
     val arr = JSONArray()
     log.forEach { arr.put(JSONObject().put("label", it.label).put("elapsed", it.elapsedSec)) }
@@ -133,6 +159,17 @@ private fun loadStepLog(prefs: SharedPreferences): List<StepEntry> {
         }
     } catch (_: Exception) { emptyList() }
 }
+
+@Composable
+private fun outlinedTextFieldColors() = OutlinedTextFieldDefaults.colors(
+    focusedBorderColor = Primary,
+    unfocusedBorderColor = SurfaceVar,
+    focusedTextColor = OnSurface,
+    unfocusedTextColor = OnSurface,
+    cursorColor = Primary,
+    focusedLabelColor = Primary,
+    unfocusedLabelColor = OnSurfaceVar,
+)
 
 // ─── Data classes ─────────────────────────────────────────────────────────────
 
@@ -194,10 +231,10 @@ private fun MainScreen() {
     var speakerNames by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
     var selectedMode by remember { mutableStateOf("diarize") }
 
-    // ── Permission: POST_NOTIFICATIONS (Android 13+) ───────────────────────
+    // ── Notification permission (Android 13+) ─────────────────────────────
     val notifPermLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { /* granted or not — we tried */ }
+    ) { }
 
     // ── Restore saved job on app start ─────────────────────────────────────
     LaunchedEffect(Unit) {
@@ -244,12 +281,17 @@ private fun MainScreen() {
                         val initialSpeakerText = if (s.hasDiarization)
                             buildSpeakerText(segs, speakerNames)
                         else s.fullText ?: ""
+                        val audioDurationSec = segs.lastOrNull()?.end?.toLong() ?: 0L
+                        val processingTimeSec = if (startMs > 0L) (System.currentTimeMillis() - startMs) / 1000 else 0L
                         HistoryManager.add(prefs, HistoryEntry(
                             id = UUID.randomUUID().toString(),
                             timestamp = System.currentTimeMillis(),
                             fileName = selectedName,
                             speakerText = initialSpeakerText,
                             fullText = s.fullText ?: "",
+                            audioDurationSec = audioDurationSec,
+                            processingTimeSec = processingTimeSec,
+                            mode = selectedMode,
                         ))
                         uiState = UiState.Done(segs, s.fullText ?: "", s.hasDiarization)
                         jobId = null
@@ -285,7 +327,7 @@ private fun MainScreen() {
                         TranscriberService.postProgress(context, s.step, (s.progress * 100).toInt(), s.progress < 0.05f)
                     }
                 }
-            } catch (_: Exception) { /* keep polling on transient errors */ }
+            } catch (_: Exception) { }
         }
     }
 
@@ -319,11 +361,9 @@ private fun MainScreen() {
     }
 
     // ── Upload ─────────────────────────────────────────────────────────────
-    fun startUpload(mode: String) {
+    fun startUpload(mode: String, startSec: Float? = null, endSec: Float? = null) {
         val uri = selectedUri ?: return
-        // Guard: already uploading — ignore extra taps
         if (uiState is UiState.Uploading || uiState is UiState.Processing) return
-        // Cancel any lingering previous job
         activeUploadJob?.cancel()
         activeUploadJob = null
 
@@ -337,11 +377,10 @@ private fun MainScreen() {
         )
         activeUploadJob = scope.launch {
             var lastError: Exception? = null
-            // Retry up to 3 times for transient network errors (DNS flap, timeout)
             for (attempt in 1..3) {
                 if (!isActive) return@launch
                 try {
-                    val id = ServerApi.submitJob(context, uri, mode)
+                    val id = ServerApi.submitJob(context, uri, mode, startSec, endSec)
                     if (!isActive) return@launch
                     activeUploadJob = null
                     prefs.edit()
@@ -355,13 +394,9 @@ private fun MainScreen() {
                 } catch (e: Exception) {
                     if (!isActive) return@launch
                     lastError = e
-                    if (attempt < 3) {
-                        uiState = UiState.Uploading  // stay in uploading, show retry implicitly
-                        delay(2_000L * attempt)      // 2s, 4s back-off
-                    }
+                    if (attempt < 3) { uiState = UiState.Uploading; delay(2_000L * attempt) }
                 }
             }
-            // All 3 attempts failed
             activity.stopService(Intent(activity, TranscriberService::class.java))
             val msg = lastError?.message ?: "Ошибка загрузки"
             uiState = UiState.Error(
@@ -375,9 +410,11 @@ private fun MainScreen() {
     // ── Dialogs ────────────────────────────────────────────────────────────
     var showVersionHistory by remember { mutableStateOf(false) }
     var showHistoryDialog by remember { mutableStateOf(false) }
+    var pendingMode by remember { mutableStateOf<String?>(null) }
 
     val versionHistory = listOf(
-        "v7.0 · Sumer · Server-side pipeline",
+        "v7.1 · Akkad · скорость плеера, выбор фрагмента, компактный UI",
+        "v7.0 · Sumer · серверный pipeline",
         "v6.9 · Phoenicia · Whisper Small INT8",
         "v6.8 · Hittite · Whisper Small INT8",
         "v6.7 · Assyria · Whisper Small INT8",
@@ -407,6 +444,18 @@ private fun MainScreen() {
         HistoryDialog(prefs = prefs) { showHistoryDialog = false }
     }
 
+    if (pendingMode != null) {
+        TimeRangeDialog(
+            mode = pendingMode!!,
+            onConfirm = { startSec, endSec ->
+                val mode = pendingMode!!
+                pendingMode = null
+                startUpload(mode, startSec, endSec)
+            },
+            onDismiss = { pendingMode = null },
+        )
+    }
+
     // ── Layout ─────────────────────────────────────────────────────────────
     androidx.compose.material3.Surface(modifier = Modifier.fillMaxSize(), color = Background) {
         Column(
@@ -422,7 +471,7 @@ private fun MainScreen() {
                     Text("Astaro Scribe",
                         style = TextStyle(fontSize = 22.sp, fontWeight = FontWeight.Bold,
                             color = Primary, letterSpacing = 0.3.sp))
-                    Text("v7.0 · Sumer",
+                    Text("v7.1 · Akkad",
                         style = TextStyle(fontSize = 12.sp, color = OnSurfaceVar),
                         modifier = Modifier.clickable { showVersionHistory = true })
                 }
@@ -440,8 +489,8 @@ private fun MainScreen() {
                     FileCard(s.name, s.sizeMb) { filePicker.launch("audio/*") }
                     Spacer(Modifier.height(16.dp))
                     ModeButtons(
-                        onFast = { startUpload("fast") },
-                        onDiarize = { startUpload("diarize") },
+                        onFast = { pendingMode = "fast" },
+                        onDiarize = { pendingMode = "diarize" },
                     )
                 }
 
@@ -466,7 +515,7 @@ private fun MainScreen() {
                     )
                     if (stepLog.isNotEmpty()) {
                         Spacer(Modifier.height(8.dp))
-                        StepLogCard(stepLog)
+                        StepLogCard(stepLog, initialExpanded = false)
                     }
                     Spacer(Modifier.height(8.dp))
                     CancelButton { cancelCurrentJob() }
@@ -482,6 +531,7 @@ private fun MainScreen() {
                         speakerText = speakerText,
                         speakerNames = speakerNames,
                         audioUri = selectedUri,
+                        stepLog = stepLog,
                         onRenameConfirm = { speakerNames = it },
                         onReset = {
                             selectedUri = null; selectedName = ""
@@ -508,6 +558,96 @@ private fun MainScreen() {
     }
 }
 
+// ─── Time Range Dialog ────────────────────────────────────────────────────────
+
+@Composable
+private fun TimeRangeDialog(
+    mode: String,
+    onConfirm: (startSec: Float?, endSec: Float?) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var useRange by remember { mutableStateOf(false) }
+    var startInput by remember { mutableStateOf("") }
+    var endInput by remember { mutableStateOf("") }
+
+    val modeLabel = if (mode == "fast") "⚡ Только текст" else "👥 Со спикерами"
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(modeLabel) },
+        text = {
+            Column {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { useRange = false }
+                        .padding(vertical = 4.dp),
+                ) {
+                    RadioButton(selected = !useRange, onClick = { useRange = false },
+                        colors = RadioButtonDefaults.colors(selectedColor = Primary))
+                    Spacer(Modifier.width(8.dp))
+                    Text("Весь файл", fontSize = 14.sp, color = OnSurface)
+                }
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { useRange = true }
+                        .padding(vertical = 4.dp),
+                ) {
+                    RadioButton(selected = useRange, onClick = { useRange = true },
+                        colors = RadioButtonDefaults.colors(selectedColor = Primary))
+                    Spacer(Modifier.width(8.dp))
+                    Text("Только фрагмент", fontSize = 14.sp, color = OnSurface)
+                }
+                AnimatedVisibility(visible = useRange) {
+                    Column(Modifier.padding(top = 8.dp)) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedTextField(
+                                value = startInput,
+                                onValueChange = { startInput = it },
+                                label = { Text("С", fontSize = 11.sp) },
+                                placeholder = { Text("0:00", fontSize = 12.sp) },
+                                modifier = Modifier.weight(1f),
+                                singleLine = true,
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Text),
+                                colors = outlinedTextFieldColors(),
+                            )
+                            OutlinedTextField(
+                                value = endInput,
+                                onValueChange = { endInput = it },
+                                label = { Text("До", fontSize = 11.sp) },
+                                placeholder = { Text("5:00", fontSize = 12.sp) },
+                                modifier = Modifier.weight(1f),
+                                singleLine = true,
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Text),
+                                colors = outlinedTextFieldColors(),
+                            )
+                        }
+                        Text("формат: мм:сс или сс",
+                            fontSize = 10.sp, color = OnSurfaceVar,
+                            modifier = Modifier.padding(top = 4.dp))
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                if (useRange) {
+                    val start = startInput.takeIf { it.isNotBlank() }?.let { parseTimeInput(it) }
+                    val end = endInput.takeIf { it.isNotBlank() }?.let { parseTimeInput(it) }
+                    onConfirm(start, end)
+                } else {
+                    onConfirm(null, null)
+                }
+            }) { Text("Начать") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Отмена") } },
+        containerColor = Surface,
+    )
+}
+
 // ─── Player ───────────────────────────────────────────────────────────────────
 
 @Composable
@@ -515,6 +655,7 @@ private fun PlayerCard(
     uri: Uri?,
     segments: List<ServerApi.Segment>,
     speakerNames: Map<String, String>,
+    hasDiarization: Boolean,
     currentSegIdx: Int,
     onCurrentSegChange: (Int) -> Unit,
     seekPositionMs: Long = -1L,
@@ -529,8 +670,8 @@ private fun PlayerCard(
     var isPlaying by remember { mutableStateOf(false) }
     var playerPos by remember { mutableStateOf(0L) }
     var playerDuration by remember { mutableStateOf(0L) }
+    var playbackSpeed by remember { mutableStateOf(1f) }
 
-    // Init MediaPlayer
     DisposableEffect(uri) {
         val mp = MediaPlayer()
         val job = scope.launch {
@@ -558,7 +699,6 @@ private fun PlayerCard(
         }
     }
 
-    // Position tracker
     LaunchedEffect(isPlaying, mediaPlayer) {
         val mp = mediaPlayer ?: return@LaunchedEffect
         if (!isPlaying) return@LaunchedEffect
@@ -571,43 +711,76 @@ private fun PlayerCard(
         }
     }
 
-    // External seek (tap on segment row)
+    LaunchedEffect(playbackSpeed) {
+        val mp = mediaPlayer ?: return@LaunchedEffect
+        if (isPlaying) {
+            runCatching {
+                mp.playbackParams = PlaybackParams()
+                    .setSpeed(playbackSpeed)
+                    .setAudioFallbackMode(PlaybackParams.AUDIO_FALLBACK_MODE_DEFAULT)
+            }
+        }
+    }
+
+    // External seek from segment tap
     LaunchedEffect(seekPositionMs) {
         if (seekPositionMs < 0L) return@LaunchedEffect
         val mp = mediaPlayer ?: return@LaunchedEffect
         mp.seekTo(seekPositionMs.toInt())
         playerPos = seekPositionMs
-        if (!isPlaying) { mp.start(); isPlaying = true }
+        // For diarize mode: auto-start on segment tap; for fast mode: seek only
+        if (hasDiarization && !isPlaying) {
+            runCatching {
+                mp.playbackParams = PlaybackParams()
+                    .setSpeed(playbackSpeed)
+                    .setAudioFallbackMode(PlaybackParams.AUDIO_FALLBACK_MODE_DEFAULT)
+            }
+            mp.start()
+            isPlaying = true
+        }
         onSeekConsumed()
     }
 
     val mp = mediaPlayer
     if (mp != null && playerDuration > 0L) {
+        val segIdx = if (currentSegIdx >= 0 && currentSegIdx < segments.size) currentSegIdx else -1
+        val speakerColor = if (segIdx >= 0 && hasDiarization) {
+            val allSpeakers = segments.map { it.speaker }.distinct().sorted()
+            speakerColor(segments[segIdx].speaker, allSpeakers)
+        } else Primary
+
         Card(
             modifier = Modifier.fillMaxWidth(),
             colors = CardDefaults.cardColors(containerColor = Surface),
             shape = RoundedCornerShape(14.dp),
             border = BorderStroke(1.dp, SurfaceVar),
         ) {
-            Column(Modifier.padding(horizontal = 16.dp, vertical = 10.dp)) {
+            Column(Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    val segIdx = if (currentSegIdx >= 0 && currentSegIdx < segments.size) currentSegIdx else -1
-                    val speakerColor = if (segIdx >= 0) {
-                        val allSpeakers = segments.map { it.speaker }.distinct().sorted()
-                        speakerColor(segments[segIdx].speaker, allSpeakers)
-                    } else OnSurfaceVar
-
-                    TextButton(
+                    FilledIconButton(
                         onClick = {
-                            if (isPlaying) { mp.pause(); isPlaying = false }
-                            else { mp.start(); isPlaying = true }
+                            if (isPlaying) {
+                                mp.pause(); isPlaying = false
+                            } else {
+                                runCatching {
+                                    mp.playbackParams = PlaybackParams()
+                                        .setSpeed(playbackSpeed)
+                                        .setAudioFallbackMode(PlaybackParams.AUDIO_FALLBACK_MODE_DEFAULT)
+                                }
+                                mp.start(); isPlaying = true
+                            }
                         },
-                        modifier = Modifier.size(44.dp),
-                        contentPadding = PaddingValues(0.dp),
+                        modifier = Modifier.size(40.dp),
+                        colors = IconButtonDefaults.filledIconButtonColors(containerColor = speakerColor),
                     ) {
-                        Text(if (isPlaying) "⏸" else "▶", fontSize = 20.sp, color = speakerColor)
+                        Icon(
+                            imageVector = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                            contentDescription = null,
+                            tint = Color(0xFF1E1B4B),
+                            modifier = Modifier.size(22.dp),
+                        )
                     }
-
+                    Spacer(Modifier.width(8.dp))
                     Column(Modifier.weight(1f)) {
                         Slider(
                             value = playerPos.toFloat() / playerDuration.toFloat(),
@@ -617,18 +790,39 @@ private fun PlayerCard(
                                 playerPos = seekTo
                             },
                             colors = SliderDefaults.colors(
-                                thumbColor = Primary,
-                                activeTrackColor = Primary,
+                                thumbColor = speakerColor,
+                                activeTrackColor = speakerColor,
                                 inactiveTrackColor = SurfaceVar,
                             ),
+                            modifier = Modifier.height(28.dp),
                         )
                         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                             Text(fmtDuration(playerPos / 1000), fontSize = 10.sp, color = OnSurfaceVar)
-                            if (segIdx >= 0) {
+                            if (segIdx >= 0 && hasDiarization) {
                                 val name = speakerNames[segments[segIdx].speaker] ?: segments[segIdx].speaker
                                 Text(name, fontSize = 10.sp, color = speakerColor)
                             }
                             Text(fmtDuration(playerDuration / 1000), fontSize = 10.sp, color = OnSurfaceVar)
+                        }
+                    }
+                }
+                Spacer(Modifier.height(6.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    listOf(1f to "1×", 1.5f to "1.5×", 2f to "2×", 3f to "3×").forEach { (speed, label) ->
+                        val selected = playbackSpeed == speed
+                        OutlinedButton(
+                            onClick = { playbackSpeed = speed },
+                            modifier = Modifier.height(24.dp),
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                            shape = RoundedCornerShape(6.dp),
+                            colors = ButtonDefaults.outlinedButtonColors(
+                                containerColor = if (selected) Primary.copy(alpha = 0.15f) else Color.Transparent,
+                                contentColor = if (selected) Primary else OnSurfaceVar,
+                            ),
+                            border = BorderStroke(1.dp, if (selected) Primary else SurfaceVar),
+                        ) {
+                            Text(label, fontSize = 10.sp,
+                                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal)
                         }
                     }
                 }
@@ -658,12 +852,13 @@ private fun ResultBlock(
     speakerText: String,
     speakerNames: Map<String, String>,
     audioUri: Uri?,
+    stepLog: List<StepEntry>,
     onRenameConfirm: (Map<String, String>) -> Unit,
     onReset: () -> Unit,
 ) {
     val context = LocalContext.current
     val hasDiarization = state.hasDiarization
-    var expandSpeaker by remember { mutableStateOf(true) }
+    var expandMain by remember { mutableStateOf(true) }
     var expandPlain by remember { mutableStateOf(false) }
     var showRenameDialog by remember { mutableStateOf(false) }
     var currentSegIdx by remember { mutableStateOf(-1) }
@@ -692,6 +887,7 @@ private fun ResultBlock(
             uri = audioUri,
             segments = state.segments,
             speakerNames = speakerNames,
+            hasDiarization = hasDiarization,
             currentSegIdx = currentSegIdx,
             onCurrentSegChange = { currentSegIdx = it },
             seekPositionMs = seekPositionMs,
@@ -700,7 +896,13 @@ private fun ResultBlock(
         Spacer(Modifier.height(8.dp))
     }
 
-    // ── По спикерам ────────────────────────────────────────────────────────
+    // ── Step log (always visible after done) ───────────────────────────────
+    if (stepLog.isNotEmpty()) {
+        StepLogCard(stepLog, initialExpanded = true)
+        Spacer(Modifier.height(8.dp))
+    }
+
+    // ── Main content card ──────────────────────────────────────────────────
     val allSpeakers = remember(state.segments) { state.segments.map { it.speaker }.distinct().sorted() }
 
     Card(
@@ -711,7 +913,9 @@ private fun ResultBlock(
     ) {
         Column {
             Row(
-                Modifier.fillMaxWidth().clickable { expandSpeaker = !expandSpeaker }
+                Modifier
+                    .fillMaxWidth()
+                    .clickable { expandMain = !expandMain }
                     .padding(horizontal = 16.dp, vertical = 12.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
@@ -720,22 +924,29 @@ private fun ResultBlock(
                     fontSize = 14.sp, color = OnSurface, modifier = Modifier.weight(1f),
                 )
                 if (hasDiarization && speakerNames.isNotEmpty()) {
-                    TextButton(
+                    IconButton(
                         onClick = { showRenameDialog = true },
-                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
-                    ) { Text("✏ Переименовать", fontSize = 11.sp, color = Primary) }
+                        modifier = Modifier.size(32.dp),
+                    ) { Text("✏", fontSize = 14.sp, color = Primary) }
                 }
-                Text(if (expandSpeaker) "▲" else "▼", fontSize = 11.sp, color = OnSurfaceVar)
+                IconButton(
+                    onClick = { copyText(context, speakerText) },
+                    modifier = Modifier.size(32.dp),
+                ) { Text("📋", fontSize = 14.sp) }
+                IconButton(
+                    onClick = { saveToDownloads(context, speakerText) },
+                    modifier = Modifier.size(32.dp),
+                ) { Text("⬇", fontSize = 14.sp, color = OnSurfaceVar) }
+                Text(if (expandMain) "▲" else "▼", fontSize = 11.sp, color = OnSurfaceVar)
             }
-            AnimatedVisibility(visible = expandSpeaker) {
+            AnimatedVisibility(visible = expandMain) {
                 Column {
                     Divider(color = SurfaceVar, thickness = 1.dp)
-                    // Segment list with highlighting
                     val segsScrollState = rememberScrollState()
                     val density = LocalDensity.current
                     LaunchedEffect(currentSegIdx) {
                         if (currentSegIdx > 1) {
-                            val px = with(density) { ((currentSegIdx - 1) * 68).dp.roundToPx() }
+                            val px = with(density) { ((currentSegIdx - 1) * 64).dp.roundToPx() }
                             segsScrollState.animateScrollTo(px)
                         }
                     }
@@ -775,12 +986,14 @@ private fun ResultBlock(
                                         modifier = Modifier.padding(start = 8.dp, top = 2.dp))
                                 }
                             } else {
-                                // Fast mode: no speaker colors, just timestamp + text
                                 Row(
                                     modifier = Modifier
                                         .fillMaxWidth()
                                         .background(if (isActive) Primary.copy(alpha = 0.10f) else Color.Transparent)
-                                        .clickable { seekPositionMs = (seg.start * 1000).toLong() }
+                                        .clickable {
+                                            // Fast mode: seek only, do NOT auto-start
+                                            seekPositionMs = (seg.start * 1000).toLong()
+                                        }
                                         .padding(horizontal = 12.dp, vertical = 6.dp),
                                     verticalAlignment = Alignment.Top,
                                 ) {
@@ -797,39 +1010,48 @@ private fun ResultBlock(
                             }
                         }
                     }
-                    Divider(color = SurfaceVar, thickness = 1.dp)
-                    Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
-                        horizontalArrangement = Arrangement.End) {
-                        TextButton(onClick = { copyText(context, speakerText) }) {
-                            Text("Копировать", color = Primary, fontSize = 13.sp)
-                        }
-                    }
                 }
             }
         }
     }
-    Spacer(Modifier.height(8.dp))
 
-    // ── Скачать ────────────────────────────────────────────────────────────
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(containerColor = Surface),
-        shape = RoundedCornerShape(14.dp),
-        border = BorderStroke(1.dp, SurfaceVar),
-    ) {
-        Row(Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
-            verticalAlignment = Alignment.CenterVertically) {
-            Text("Скачать файл", fontSize = 14.sp, color = OnSurface, modifier = Modifier.weight(1f))
-            TextButton(onClick = { saveToDownloads(context, speakerText) }) {
-                Text("⬇ .txt", color = Primary, fontSize = 13.sp)
+    // ── Сплошной текст (only for diarize mode, collapsed by default) ───────
+    if (hasDiarization) {
+        Spacer(Modifier.height(8.dp))
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = Surface),
+            shape = RoundedCornerShape(14.dp),
+            border = BorderStroke(1.dp, SurfaceVar),
+        ) {
+            Column {
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .clickable { expandPlain = !expandPlain }
+                        .padding(horizontal = 16.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text("Сплошной текст", fontSize = 14.sp, color = OnSurface, modifier = Modifier.weight(1f))
+                    IconButton(
+                        onClick = { copyText(context, state.fullText) },
+                        modifier = Modifier.size(32.dp),
+                    ) { Text("📋", fontSize = 14.sp) }
+                    Text(if (expandPlain) "▲" else "▼", fontSize = 11.sp, color = OnSurfaceVar)
+                }
+                AnimatedVisibility(visible = expandPlain) {
+                    Column {
+                        Divider(color = SurfaceVar, thickness = 1.dp)
+                        Text(
+                            text = state.fullText.ifEmpty { "(пусто)" },
+                            modifier = Modifier.fillMaxWidth().padding(16.dp),
+                            fontSize = 12.sp, color = OnSurface,
+                            fontFamily = FontFamily.Monospace, lineHeight = 18.sp,
+                        )
+                    }
+                }
             }
         }
-    }
-    Spacer(Modifier.height(8.dp))
-
-    // ── Сплошной текст ─────────────────────────────────────────────────────
-    ResultPanel("Сплошной текст", expandPlain, { expandPlain = !expandPlain }, state.fullText) {
-        copyText(context, state.fullText)
     }
 }
 
@@ -854,12 +1076,7 @@ private fun SpeakerRenameDialog(
                         label = { Text(rawId, fontSize = 11.sp) },
                         modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
                         singleLine = true,
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedBorderColor = Primary,
-                            unfocusedBorderColor = SurfaceVar,
-                            focusedTextColor = OnSurface,
-                            unfocusedTextColor = OnSurface,
-                        ),
+                        colors = outlinedTextFieldColors(),
                     )
                 }
             }
@@ -910,21 +1127,47 @@ private fun HistoryDialog(prefs: SharedPreferences, onDismiss: () -> Unit) {
                 Column(Modifier.verticalScroll(rememberScrollState())) {
                     entries.forEach { e ->
                         Card(
-                            modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp).clickable { viewEntry = e },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 3.dp)
+                                .clickable { viewEntry = e },
                             colors = CardDefaults.cardColors(containerColor = SurfaceVar),
                             shape = RoundedCornerShape(10.dp),
                         ) {
                             Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
                                 Column(Modifier.weight(1f)) {
-                                    Text(e.fileName, fontSize = 13.sp, color = OnSurface,
-                                        maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Medium)
-                                    Text(fmtDate(e.timestamp), fontSize = 11.sp, color = OnSurfaceVar)
-                                    Text(e.speakerText.take(80) + if (e.speakerText.length > 80) "…" else "",
-                                        fontSize = 11.sp, color = OnSurfaceVar, maxLines = 2)
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Text(e.fileName, fontSize = 13.sp, color = OnSurface,
+                                            maxLines = 1, overflow = TextOverflow.Ellipsis,
+                                            fontWeight = FontWeight.Medium,
+                                            modifier = Modifier.weight(1f))
+                                        Spacer(Modifier.width(6.dp))
+                                        val modeLabel = if (e.mode == "fast") "⚡" else "👥"
+                                        Text(modeLabel, fontSize = 12.sp)
+                                    }
+                                    Row(
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                        modifier = Modifier.padding(top = 2.dp),
+                                    ) {
+                                        Text(fmtDate(e.timestamp), fontSize = 11.sp, color = OnSurfaceVar)
+                                        if (e.audioDurationSec > 0L) {
+                                            Text("·", fontSize = 11.sp, color = OnSurfaceVar)
+                                            Text(fmtDuration(e.audioDurationSec), fontSize = 11.sp, color = OnSurfaceVar)
+                                        }
+                                        if (e.processingTimeSec > 0L) {
+                                            Text("·", fontSize = 11.sp, color = OnSurfaceVar)
+                                            Text(fmtProcessingTime(e.processingTimeSec), fontSize = 11.sp, color = OnSurfaceVar)
+                                        }
+                                    }
+                                    Text(
+                                        e.speakerText.take(80) + if (e.speakerText.length > 80) "…" else "",
+                                        fontSize = 11.sp, color = OnSurfaceVar, maxLines = 2,
+                                        modifier = Modifier.padding(top = 2.dp),
+                                    )
                                 }
-                                TextButton(
+                                IconButton(
                                     onClick = { HistoryManager.delete(prefs, e.id); entries = HistoryManager.load(prefs) },
-                                    contentPadding = PaddingValues(4.dp),
+                                    modifier = Modifier.size(32.dp),
                                 ) { Text("✕", color = ErrorRed, fontSize = 14.sp) }
                             }
                         }
@@ -994,7 +1237,6 @@ private fun ProgressCard(
 ) {
     val timeStr = if (elapsedSec > 0) "  ⏱ ${fmtDuration(elapsedSec)}" else ""
 
-    // ETA: prefer segment-rate ETA during transcription (much more accurate)
     val etaSec: Long = when {
         segsTotal > 0 && segsDone > 0 && phaseElapsedSec > 5 -> {
             val secsPerSeg = phaseElapsedSec.toLong() / segsDone
@@ -1055,8 +1297,8 @@ private fun ProgressCard(
 }
 
 @Composable
-private fun StepLogCard(log: List<StepEntry>) {
-    var expanded by remember { mutableStateOf(false) }
+private fun StepLogCard(log: List<StepEntry>, initialExpanded: Boolean = false) {
+    var expanded by remember { mutableStateOf(initialExpanded) }
     Card(
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = Surface),
@@ -1065,7 +1307,9 @@ private fun StepLogCard(log: List<StepEntry>) {
     ) {
         Column {
             Row(
-                modifier = Modifier.fillMaxWidth().clickable { expanded = !expanded }
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { expanded = !expanded }
                     .padding(horizontal = 16.dp, vertical = 10.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
@@ -1127,15 +1371,6 @@ private fun ModeButtons(onFast: () -> Unit, onDiarize: () -> Unit) {
 }
 
 @Composable
-private fun ActionButton(label: String, onClick: () -> Unit) {
-    Button(onClick = onClick, modifier = Modifier.fillMaxWidth().height(56.dp),
-        colors = ButtonDefaults.buttonColors(containerColor = AccentIndigo),
-        shape = RoundedCornerShape(14.dp)) {
-        Text(label, fontWeight = FontWeight.SemiBold, fontSize = 15.sp, color = Color.White)
-    }
-}
-
-@Composable
 private fun CancelButton(onClick: () -> Unit) {
     OutlinedButton(
         onClick = onClick, modifier = Modifier.fillMaxWidth(),
@@ -1157,36 +1392,6 @@ private fun ErrorCard(message: String, onRetry: () -> Unit) {
             Text(message, fontSize = 12.sp, color = OnSurfaceVar)
             Spacer(Modifier.height(12.dp))
             TextButton(onClick = onRetry) { Text("↩ Попробовать снова", color = Primary) }
-        }
-    }
-}
-
-@Composable
-private fun ResultPanel(title: String, expanded: Boolean, onToggle: () -> Unit, content: String, onCopy: () -> Unit) {
-    Card(modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(containerColor = Surface),
-        shape = RoundedCornerShape(14.dp),
-        border = BorderStroke(1.dp, SurfaceVar)) {
-        Column {
-            Row(Modifier.fillMaxWidth().clickable(onClick = onToggle).padding(horizontal = 16.dp, vertical = 12.dp),
-                verticalAlignment = Alignment.CenterVertically) {
-                Text(title, fontSize = 14.sp, color = OnSurface, modifier = Modifier.weight(1f))
-                Text(if (expanded) "▲" else "▼", fontSize = 11.sp, color = OnSurfaceVar)
-            }
-            AnimatedVisibility(visible = expanded) {
-                Column {
-                    Divider(color = SurfaceVar, thickness = 1.dp)
-                    Text(text = content.ifEmpty { "(пусто)" },
-                        modifier = Modifier.fillMaxWidth().padding(16.dp),
-                        fontSize = 12.sp, color = OnSurface,
-                        fontFamily = FontFamily.Monospace, lineHeight = 18.sp)
-                    Divider(color = SurfaceVar, thickness = 1.dp)
-                    Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
-                        horizontalArrangement = Arrangement.End) {
-                        TextButton(onClick = onCopy) { Text("Копировать", color = Primary, fontSize = 13.sp) }
-                    }
-                }
-            }
         }
     }
 }

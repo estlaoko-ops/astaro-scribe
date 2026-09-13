@@ -17,8 +17,8 @@ android {
         applicationId = "com.diarizer.sherpa"
         minSdk = 26
         targetSdk = 34
-        versionCode = 14
-        versionName = "7.0"
+        versionCode = 15
+        versionName = "7.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -71,6 +71,7 @@ dependencies {
     implementation(libs.androidx.ui.graphics)
     implementation(libs.androidx.ui.tooling.preview)
     implementation(libs.androidx.material3)
+    implementation("androidx.compose.material:material-icons-core")
     implementation(libs.androidx.documentfile)
 
     testImplementation(libs.junit)

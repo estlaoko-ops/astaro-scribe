@@ -100,6 +100,9 @@ def submit():
     if mode not in ("diarize", "fast"):
         mode = "diarize"
 
+    start_sec = request.args.get("start_sec", type=float)
+    end_sec   = request.args.get("end_sec",   type=float)
+
     audio = request.files["audio"]
     job_id = str(uuid.uuid4())
 
@@ -123,9 +126,14 @@ def submit():
             "mode": mode,
         }
 
-    t = threading.Thread(target=process_job, args=(job_id, tmp.name, mode), daemon=True)
+    t = threading.Thread(
+        target=process_job,
+        args=(job_id, tmp.name, mode),
+        kwargs={"start_sec": start_sec, "end_sec": end_sec},
+        daemon=True,
+    )
     t.start()
-    log(f"submit: job_id={job_id} mode={mode}")
+    log(f"submit: job_id={job_id} mode={mode} trim={start_sec}→{end_sec}")
     return jsonify({"job_id": job_id})
 
 
@@ -167,9 +175,31 @@ def status(job_id):
 
 # ─── Worker ───────────────────────────────────────────────────────────────────
 
-def process_job(job_id: str, audio_path: str, mode: str):
+def process_job(job_id: str, audio_path: str, mode: str,
+                start_sec: float = None, end_sec: float = None):
     extra_paths: list[str] = []
     try:
+        # ── Pre-trim if requested ──────────────────────────────────────────
+        if start_sec is not None or end_sec is not None:
+            update_job(job_id, step="Обрезка фрагмента...", progress=0.02)
+            suffix = os.path.splitext(audio_path)[1] or ".audio"
+            trim_path = audio_path + "_trim" + suffix
+            extra_paths.append(trim_path)
+            ff_args = ["ffmpeg", "-y"]
+            if start_sec and start_sec > 0:
+                ff_args += ["-ss", str(start_sec)]
+            ff_args += ["-i", audio_path]
+            if end_sec and end_sec > 0:
+                duration = end_sec - (start_sec or 0.0)
+                ff_args += ["-t", str(max(duration, 0.5))]
+            ff_args += ["-c", "copy", trim_path]
+            res = subprocess.run(ff_args, capture_output=True)
+            if res.returncode == 0 and os.path.exists(trim_path):
+                audio_path = trim_path
+                log(f"[{job_id}] trimmed {start_sec}s → {end_sec}s")
+            else:
+                log(f"[{job_id}] trim failed, using full file")
+
         wav_path = audio_path + "_16k.wav"
         extra_paths.append(wav_path)
 

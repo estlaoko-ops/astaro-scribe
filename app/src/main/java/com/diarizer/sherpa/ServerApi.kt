@@ -39,8 +39,13 @@ object ServerApi {
 
     private val auth: String get() = BuildConfig.WHISPER_AUTH
 
-    suspend fun submitJob(context: Context, uri: Uri, mode: String = "diarize"): String = withContext(Dispatchers.IO) {
-        val submitUrl = "$baseUrl/pipeline/submit?mode=$mode"
+    suspend fun submitJob(
+        context: Context, uri: Uri, mode: String = "diarize",
+        startSec: Float? = null, endSec: Float? = null,
+    ): String = withContext(Dispatchers.IO) {
+        var submitUrl = "$baseUrl/pipeline/submit?mode=$mode"
+        if (startSec != null && startSec > 0f) submitUrl += "&start_sec=$startSec"
+        if (endSec != null && endSec > 0f) submitUrl += "&end_sec=$endSec"
 
         val cr = context.contentResolver
         val mimeType = cr.getType(uri) ?: "audio/mpeg"
